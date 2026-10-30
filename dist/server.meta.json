@@ -1,11 +1,11 @@
 {
   "sdkMajor": 0,
-  "sdkVersion": "0.4.34",
+  "sdkVersion": "0.6.104",
   "artifactFormatVersion": 1,
   "pluginId": "preset-sync",
   "pluginVersion": "0.2.2",
   "builtWith": {
-    "bbVersion": "0.41.0",
-    "pluginSdkVersion": "0.4.34"
+    "bbVersion": "0.48.2-nightly.40981326765.1",
+    "pluginSdkVersion": "0.6.104"
   }
 }
