@@ -134,7 +134,9 @@ async function withClone<T>(
     );
     return await operation(repoDir);
   } finally {
-    await rm(tempRoot, { recursive: true, force: true });
+    // Windows: a just-exited git child or AV scan can hold .git handles briefly;
+    // retry instead of letting cleanup mask the operation result.
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 }
 
