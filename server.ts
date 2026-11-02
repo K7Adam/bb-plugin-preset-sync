@@ -122,6 +122,64 @@ export default async function plugin(bb: BbPluginApi) {
       options: ["Off", "1 minute", "5 minutes", "10 minutes", "15 minutes", "30 minutes", "60 minutes"],
       default: "5 minutes",
     },
+    syncPlugins: {
+      type: "boolean",
+      label: "Sync plugins",
+      description:
+        "Capture, install, and enable/disable plugins through the preset. When off, the preset keeps whatever the remote already records.",
+      default: true,
+    },
+    syncMarketplaces: {
+      type: "boolean",
+      label: "Sync marketplaces",
+      description: "Sync third-party plugin marketplaces.",
+      default: true,
+    },
+    syncGeneralSettings: {
+      type: "boolean",
+      label: "Sync general settings",
+      description: "Sync general BB settings through the preset.",
+      default: true,
+    },
+    syncExperiments: {
+      type: "boolean",
+      label: "Sync experiment flags",
+      description: "Sync BB experiment flags.",
+      default: true,
+    },
+    syncKeybindings: {
+      type: "boolean",
+      label: "Sync keyboard shortcuts",
+      description: "Sync keyboard shortcut overrides.",
+      default: true,
+    },
+    syncAppearance: {
+      type: "boolean",
+      label: "Sync appearance",
+      description: "Sync theme and favicon color.",
+      default: true,
+    },
+    excludedPlugins: {
+      type: "string",
+      label: "Excluded plugins",
+      description:
+        "Comma-separated plugin IDs left unmanaged: never captured, installed, enabled, disabled, or configured from the preset.",
+      default: "",
+    },
+    excludedSettingKeys: {
+      type: "string",
+      label: "Excluded general settings keys",
+      description:
+        "Comma-separated general settings keys excluded from sync (for example: defaultProviderId, providerOrder).",
+      default: "",
+    },
+    excludedPluginSettingKeys: {
+      type: "string",
+      label: "Excluded plugin settings",
+      description:
+        "Comma-separated pluginId.settingKey pairs excluded from plugin settings sync.",
+      default: "",
+    },
   });
 
   const service = new PresetSyncService(bb, async () => {
@@ -134,6 +192,15 @@ export default async function plugin(bb: BbPluginApi) {
       gitAuthorEmail: value.gitAuthorEmail,
       includePluginSettings: value.includePluginSettings,
       backgroundCheckInterval: value.backgroundCheckInterval,
+      syncPlugins: value.syncPlugins,
+      syncMarketplaces: value.syncMarketplaces,
+      syncGeneralSettings: value.syncGeneralSettings,
+      syncExperiments: value.syncExperiments,
+      syncKeybindings: value.syncKeybindings,
+      syncAppearance: value.syncAppearance,
+      excludedPlugins: value.excludedPlugins ?? "",
+      excludedSettingKeys: value.excludedSettingKeys ?? "",
+      excludedPluginSettingKeys: value.excludedPluginSettingKeys ?? "",
     };
   });
 

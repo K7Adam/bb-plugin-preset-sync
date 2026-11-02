@@ -66,6 +66,31 @@ Background comparisons run every five minutes by default. Change
 `Off`, 1, 5, 10, 15, 30, or 60 minutes. A background check never pulls or
 pushes automatically.
 
+## Sync scope
+
+Choose what this machine manages through the preset, under **Settings ->
+Plugins -> Preset Sync** or via `bb plugin config preset-sync set <key> <value>`:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `syncPlugins` | `true` | Capture, install, and enable/disable plugins |
+| `syncMarketplaces` | `true` | Sync third-party marketplaces |
+| `syncGeneralSettings` | `true` | Sync general BB settings |
+| `syncExperiments` | `true` | Sync experiment flags |
+| `syncKeybindings` | `true` | Sync keyboard shortcut overrides |
+| `syncAppearance` | `true` | Sync theme and favicon color |
+| `includePluginSettings` | `true` | Capture and apply non-secret plugin settings |
+| `excludedPlugins` | `""` | Comma-separated plugin IDs left completely unmanaged |
+| `excludedSettingKeys` | `""` | Comma-separated general settings keys to exclude |
+| `excludedPluginSettingKeys` | `""` | Comma-separated `pluginId.key` pairs to exclude |
+
+Exclusions are per-machine and work in both directions: an excluded plugin is
+neither recorded into the preset nor installed/configured from it. On push,
+remote preset entries that fall outside this machine's scope are preserved, so
+one machine can opt out of a plugin or setting without deleting it for the
+others. `bb preset diff` and `bb preset status` note scoped-out entries as
+warnings.
+
 ## Commands
 
 ```text

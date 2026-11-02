@@ -18,6 +18,11 @@ import {
   type PluginSettingPresetEntry,
   type PresetSnapshot,
   type SyncPlan,
+  applySyncScope,
+  mergePresetForPush,
+  parseIdListSetting,
+  syncScopeWarnings,
+  type SyncScope,
 } from "./preset";
 import { pushRemotePreset, readRemotePreset } from "./git";
 
@@ -29,6 +34,32 @@ export interface SyncSettings {
   gitAuthorEmail: string;
   includePluginSettings: boolean;
   backgroundCheckInterval: string;
+  syncPlugins: boolean;
+  syncMarketplaces: boolean;
+  syncGeneralSettings: boolean;
+  syncExperiments: boolean;
+  syncKeybindings: boolean;
+  syncAppearance: boolean;
+  excludedPlugins: string;
+  excludedSettingKeys: string;
+  excludedPluginSettingKeys: string;
+}
+
+function scopeFromSettings(settings: SyncSettings): SyncScope {
+  return {
+    syncPlugins: settings.syncPlugins,
+    syncMarketplaces: settings.syncMarketplaces,
+    syncGeneralSettings: settings.syncGeneralSettings,
+    syncExperiments: settings.syncExperiments,
+    syncKeybindings: settings.syncKeybindings,
+    syncAppearance: settings.syncAppearance,
+    syncPluginSettings: settings.includePluginSettings,
+    excludedPlugins: parseIdListSetting(settings.excludedPlugins),
+    excludedSettingKeys: parseIdListSetting(settings.excludedSettingKeys),
+    excludedPluginSettingKeys: parseIdListSetting(
+      settings.excludedPluginSettingKeys,
+    ),
+  };
 }
 
 interface CapturedPreset {
@@ -304,12 +335,19 @@ export class PresetSyncService {
       marketplaces: portableMarketplaces,
       pluginSettings,
     });
-    return { snapshot, warnings: unique(warnings) };
+    const scope = scopeFromSettings(settings);
+    warnings.push(...syncScopeWarnings(scope, null, snapshot));
+    return {
+      snapshot: applySyncScope(snapshot, scope),
+      warnings: unique(warnings),
+    };
   }
 
   private async remoteAndLocal(signal?: AbortSignal): Promise<{
     remote: Awaited<ReturnType<typeof readRemotePreset>>;
+    remoteScoped: Awaited<ReturnType<typeof readRemotePreset>>;
     local: CapturedPreset;
+    scope: SyncScope;
     settings: SyncSettings;
   }> {
     const settings = await this.remoteSettings();
@@ -322,18 +360,34 @@ export class PresetSyncService {
       }),
       this.captureSnapshot(signal),
     ]);
-    return { remote, local, settings };
+    const scope = scopeFromSettings(settings);
+    return {
+      remote,
+      remoteScoped: {
+        ...remote,
+        snapshot: applySyncScope(remote.snapshot, scope),
+      },
+      local: {
+        ...local,
+        warnings: [
+          ...local.warnings,
+          ...syncScopeWarnings(scope, remote.snapshot, local.snapshot),
+        ],
+      },
+      scope,
+      settings,
+    };
   }
 
   async preview(signal?: AbortSignal): Promise<SyncPlan> {
     return this.exclusive(async () => {
-      const { remote, local, settings } = await this.remoteAndLocal(signal);
+      const { remoteScoped, local, settings } = await this.remoteAndLocal(signal);
       return buildPullPlan({
         repository: settings.repositoryUrl,
         branch: settings.branch,
-        remoteHead: remote.head,
+        remoteHead: remoteScoped.head,
         local: local.snapshot,
-        remote: remote.snapshot,
+        remote: remoteScoped.snapshot,
         warnings: local.warnings,
       });
     });
@@ -341,20 +395,24 @@ export class PresetSyncService {
 
   async status(signal?: AbortSignal) {
     return this.exclusive(async () => {
-      const { remote, local, settings } = await this.remoteAndLocal(signal);
+      const { remote, remoteScoped, local, scope, settings } =
+        await this.remoteAndLocal(signal);
       const plan = buildPullPlan({
         repository: settings.repositoryUrl,
         branch: settings.branch,
-        remoteHead: remote.head,
+        remoteHead: remoteScoped.head,
         local: local.snapshot,
-        remote: remote.snapshot,
+        remote: remoteScoped.snapshot,
         warnings: local.warnings,
       });
       const [staged, lastOperation] = await Promise.all([
         this.readStaged(),
         this.readLastOperation(),
       ]);
-      const pushChanges = buildPushChanges(local.snapshot, remote.snapshot);
+      const pushChanges = buildPushChanges(
+        mergePresetForPush(local.snapshot, remote.snapshot, scope),
+        remote.snapshot,
+      );
       const checkedAt = new Date().toISOString();
       const status = {
         checkedAt,
@@ -485,6 +543,20 @@ export class PresetSyncService {
         };
         await this.bb.storage.kv.set(STAGED_KEY, staged);
       }
+      const scope = scopeFromSettings(settings);
+      let remoteSnapshot: PresetSnapshot | null = null;
+      try {
+        remoteSnapshot = (
+          await readRemotePreset({
+            repositoryUrl: settings.repositoryUrl,
+            branch: settings.branch,
+            githubToken: settings.githubToken,
+            signal: args.signal,
+          })
+        ).snapshot;
+      } catch {
+        remoteSnapshot = null;
+      }
       const pushed = await pushRemotePreset(
         {
           repositoryUrl: settings.repositoryUrl,
@@ -495,7 +567,7 @@ export class PresetSyncService {
           message: args.message?.trim() || "chore: sync BB preset",
           signal: args.signal,
         },
-        staged.snapshot,
+        mergePresetForPush(staged.snapshot, remoteSnapshot, scope),
       );
       const at = new Date().toISOString();
       await this.writeLastOperation({
@@ -517,13 +589,13 @@ export class PresetSyncService {
 
   async pullAndApply(signal?: AbortSignal) {
     return this.exclusive(async () => {
-      const { remote, local, settings } = await this.remoteAndLocal(signal);
+      const { remoteScoped, local, settings } = await this.remoteAndLocal(signal);
       const plan = buildPullPlan({
         repository: settings.repositoryUrl,
         branch: settings.branch,
-        remoteHead: remote.head,
+        remoteHead: remoteScoped.head,
         local: local.snapshot,
-        remote: remote.snapshot,
+        remote: remoteScoped.snapshot,
         warnings: local.warnings,
       });
       const applied: string[] = [];
@@ -546,7 +618,7 @@ export class PresetSyncService {
       const marketplaceMap = new Map(
         currentMarketplaces.map((marketplace) => [marketplace.name, marketplace]),
       );
-      for (const marketplace of remote.snapshot.marketplaces) {
+      for (const marketplace of remoteScoped.snapshot.marketplaces) {
         const current = marketplaceMap.get(marketplace.name);
         if (current === undefined) {
           if (!isPortableMarketplaceSource(marketplace.source)) {
@@ -563,7 +635,7 @@ export class PresetSyncService {
 
       let pluginList = await this.bb.sdk.plugins.list({ signal });
       let installed = new Map(pluginList.plugins.map((plugin) => [plugin.id, plugin]));
-      for (const plugin of remote.snapshot.plugins) {
+      for (const plugin of remoteScoped.snapshot.plugins) {
         if (plugin.id === SELF_PLUGIN_ID || installed.has(plugin.id)) continue;
         if (!isPortableInstallSource(plugin.install)) {
           skipped.push(`Skipped local-path plugin ${plugin.id}`);
@@ -578,7 +650,7 @@ export class PresetSyncService {
       installed = new Map(pluginList.plugins.map((plugin) => [plugin.id, plugin]));
 
       const desiredSettings = new Map<string, PluginSettingPresetEntry[]>();
-      for (const entry of remote.snapshot.pluginSettings) {
+      for (const entry of remoteScoped.snapshot.pluginSettings) {
         if (
           entry.id === SELF_PLUGIN_ID ||
           settingSafetyIssue(entry.key, entry.value) !== null
@@ -627,7 +699,7 @@ export class PresetSyncService {
       }
 
       const desiredPluginMap = new Map(
-        remote.snapshot.plugins.map((plugin) => [plugin.id, plugin]),
+        remoteScoped.snapshot.plugins.map((plugin) => [plugin.id, plugin]),
       );
       for (const [pluginId, desired] of desiredPluginMap) {
         if (pluginId === SELF_PLUGIN_ID) continue;
@@ -648,36 +720,36 @@ export class PresetSyncService {
         }
       }
 
-      if (!sameJson(local.snapshot.settings.generalSettings, remote.snapshot.settings.generalSettings)) {
+      if (!sameJson(local.snapshot.settings.generalSettings, remoteScoped.snapshot.settings.generalSettings)) {
         await attempt("Updated BB general settings", () =>
           this.bb.sdk.system.updateGeneralSettings(
-            remote.snapshot.settings.generalSettings as SystemConfig["generalSettings"],
+            remoteScoped.snapshot.settings.generalSettings as SystemConfig["generalSettings"],
           ),
         );
       }
-      if (!sameJson(local.snapshot.settings.experiments, remote.snapshot.settings.experiments)) {
+      if (!sameJson(local.snapshot.settings.experiments, remoteScoped.snapshot.settings.experiments)) {
         await attempt("Updated BB experiments", () =>
           this.bb.sdk.system.updateExperiments(
-            remote.snapshot.settings.experiments as SystemConfig["experiments"],
+            remoteScoped.snapshot.settings.experiments as SystemConfig["experiments"],
           ),
         );
       }
       if (
         !sameJson(
           local.snapshot.settings.keybindingOverrides,
-          remote.snapshot.settings.keybindingOverrides,
+          remoteScoped.snapshot.settings.keybindingOverrides,
         )
       ) {
         await attempt("Updated keyboard shortcuts", () =>
           this.bb.sdk.system.updateKeyboardSettings(
-            remote.snapshot.settings
+            remoteScoped.snapshot.settings
               .keybindingOverrides as SystemConfig["keybindingOverrides"],
           ),
         );
       }
-      if (!sameJson(local.snapshot.settings.appearance, remote.snapshot.settings.appearance)) {
+      if (!sameJson(local.snapshot.settings.appearance, remoteScoped.snapshot.settings.appearance)) {
         await attempt("Updated BB theme", () =>
-          this.bb.sdk.theme.set(remote.snapshot.settings.appearance),
+          this.bb.sdk.theme.set(remoteScoped.snapshot.settings.appearance),
         );
       }
 

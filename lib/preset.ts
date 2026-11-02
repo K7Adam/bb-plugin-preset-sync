@@ -470,6 +470,183 @@ export async function writePresetSnapshot(
   ]);
 }
 
+export interface SyncScope {
+  syncPlugins: boolean;
+  syncMarketplaces: boolean;
+  syncGeneralSettings: boolean;
+  syncExperiments: boolean;
+  syncKeybindings: boolean;
+  syncAppearance: boolean;
+  syncPluginSettings: boolean;
+  excludedPlugins: ReadonlySet<string>;
+  excludedSettingKeys: ReadonlySet<string>;
+  excludedPluginSettingKeys: ReadonlySet<string>;
+}
+
+export const FULL_SYNC_SCOPE: SyncScope = {
+  syncPlugins: true,
+  syncMarketplaces: true,
+  syncGeneralSettings: true,
+  syncExperiments: true,
+  syncKeybindings: true,
+  syncAppearance: true,
+  syncPluginSettings: true,
+  excludedPlugins: new Set(),
+  excludedSettingKeys: new Set(),
+  excludedPluginSettingKeys: new Set(),
+};
+
+export function parseIdListSetting(value: string | undefined): Set<string> {
+  if (value === undefined) return new Set();
+  return new Set(
+    value
+      .split(/[,\n]+/)
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0),
+  );
+}
+
+export function applySyncScope(
+  snapshot: PresetSnapshot,
+  scope: SyncScope,
+): PresetSnapshot {
+  return {
+    ...snapshot,
+    plugins: scope.syncPlugins
+      ? snapshot.plugins.filter((entry) => !scope.excludedPlugins.has(entry.id))
+      : [],
+    marketplaces: scope.syncMarketplaces ? snapshot.marketplaces : [],
+    pluginSettings: scope.syncPluginSettings
+      ? snapshot.pluginSettings.filter(
+          (entry) =>
+            !scope.excludedPlugins.has(entry.id) &&
+            !scope.excludedPluginSettingKeys.has(`${entry.id}.${entry.key}`),
+        )
+      : [],
+    settings: {
+      generalSettings: scope.syncGeneralSettings
+        ? Object.fromEntries(
+            Object.entries(snapshot.settings.generalSettings).filter(
+              ([key]) => !scope.excludedSettingKeys.has(key),
+            ),
+          )
+        : {},
+      experiments: scope.syncExperiments ? snapshot.settings.experiments : {},
+      keybindingOverrides: scope.syncKeybindings
+        ? snapshot.settings.keybindingOverrides
+        : [],
+      appearance: scope.syncAppearance
+        ? snapshot.settings.appearance
+        : { themeId: "default", faviconColor: "default" },
+    },
+  };
+}
+
+export function mergePresetForPush(
+  local: PresetSnapshot,
+  remote: PresetSnapshot | null,
+  scope: SyncScope,
+): PresetSnapshot {
+  const remotePlugins = remote?.plugins ?? [];
+  const remoteSettings = remote?.pluginSettings ?? [];
+  const remoteGeneral = remote?.settings.generalSettings ?? {};
+  const preservedGeneralKeys = Object.fromEntries(
+    Object.entries(remoteGeneral).filter(([key]) =>
+      scope.excludedSettingKeys.has(key),
+    ),
+  );
+  return {
+    ...local,
+    plugins: scope.syncPlugins
+      ? [
+          ...local.plugins,
+          ...remotePlugins.filter(
+            (entry) =>
+              scope.excludedPlugins.has(entry.id) &&
+              !local.plugins.some((own) => own.id === entry.id),
+          ),
+        ]
+      : remotePlugins,
+    marketplaces: scope.syncMarketplaces
+      ? local.marketplaces
+      : (remote?.marketplaces ?? []),
+    pluginSettings: scope.syncPluginSettings
+      ? [
+          ...local.pluginSettings,
+          ...remoteSettings.filter(
+            (entry) =>
+              (scope.excludedPlugins.has(entry.id) ||
+                scope.excludedPluginSettingKeys.has(
+                  `${entry.id}.${entry.key}`,
+                )) &&
+              !local.pluginSettings.some(
+                (own) => own.id === entry.id && own.key === entry.key,
+              ),
+          ),
+        ]
+      : remoteSettings,
+    settings: {
+      generalSettings: scope.syncGeneralSettings
+        ? { ...preservedGeneralKeys, ...local.settings.generalSettings }
+        : remoteGeneral,
+      experiments: scope.syncExperiments
+        ? local.settings.experiments
+        : (remote?.settings.experiments ?? {}),
+      keybindingOverrides: scope.syncKeybindings
+        ? local.settings.keybindingOverrides
+        : (remote?.settings.keybindingOverrides ?? []),
+      appearance: scope.syncAppearance
+        ? local.settings.appearance
+        : (remote?.settings.appearance ?? {
+            themeId: "default",
+            faviconColor: "default",
+          }),
+    },
+  };
+}
+
+export function syncScopeWarnings(
+  scope: SyncScope,
+  remote: PresetSnapshot | null,
+  local: PresetSnapshot,
+): string[] {
+  const warnings: string[] = [];
+  const remotePluginIds = new Set((remote?.plugins ?? []).map((p) => p.id));
+  const localPluginIds = new Set(local.plugins.map((p) => p.id));
+  for (const id of scope.excludedPlugins) {
+    if (remotePluginIds.has(id)) {
+      warnings.push(
+        `Plugin ${id} is in the preset but excluded on this machine (kept unmanaged).`,
+      );
+    } else if (localPluginIds.has(id)) {
+      warnings.push(
+        `Local plugin ${id} is excluded and not recorded in the preset.`,
+      );
+    }
+  }
+  const remoteGeneral = remote?.settings.generalSettings ?? {};
+  const generalKeys = new Set([
+    ...Object.keys(remoteGeneral),
+    ...Object.keys(local.settings.generalSettings),
+  ]);
+  for (const key of scope.excludedSettingKeys) {
+    if (generalKeys.has(key)) {
+      warnings.push(`General setting ${key} is excluded from sync on this machine.`);
+    }
+  }
+  const remoteSettingKeys = new Set(
+    (remote?.pluginSettings ?? []).map((e) => `${e.id}.${e.key}`),
+  );
+  for (const pair of scope.excludedPluginSettingKeys) {
+    if (remoteSettingKeys.has(pair)) {
+      warnings.push(
+        `Plugin setting ${pair} is in the preset but excluded on this machine.`,
+      );
+    }
+  }
+  return warnings;
+}
+
 export function isSensitiveSettingKey(key: string): boolean {
   return /(?:api.?key|auth|credential|pass(?:word)?|private.?key|secret|token)/i.test(
     key,

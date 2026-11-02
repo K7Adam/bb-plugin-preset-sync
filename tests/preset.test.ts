@@ -12,7 +12,12 @@ import {
   samePresetConfiguration,
   writePresetSnapshot,
   settingSafetyIssue,
+  applySyncScope,
+  mergePresetForPush,
+  parseIdListSetting,
+  FULL_SYNC_SCOPE,
   type PresetSnapshot,
+  type SyncScope,
 } from "../lib/preset";
 
 const temporaryDirectories: string[] = [];
@@ -197,5 +202,82 @@ describe("preset safety", () => {
     await expect(readPresetSnapshot(directory)).rejects.toThrow(
       "Preset path must not be a symbolic link: preset/settings.json",
     );
+  });
+});
+
+describe("sync scope", () => {
+  const scope = (overrides: Partial<SyncScope> = {}): SyncScope => ({
+    ...FULL_SYNC_SCOPE,
+    ...overrides,
+  });
+
+  it("parses comma- and newline-separated id lists", () => {
+    expect(parseIdListSetting("jira, env-catalog\n")).toEqual(
+      new Set(["jira", "env-catalog"]),
+    );
+    expect(parseIdListSetting(undefined)).toEqual(new Set());
+  });
+
+  it("filters excluded plugins and setting keys from both directions", () => {
+    const snap = snapshot({
+      plugins: [
+        { id: "jira", install: "jira@bb-community", enabled: true },
+        { id: "tasks", install: "builtin:tasks", enabled: true },
+      ],
+      pluginSettings: [
+        { id: "jira", key: "baseUrl", value: "https://x" },
+        { id: "tasks", key: "view", value: "board" },
+      ],
+    });
+    snap.settings.generalSettings.defaultProviderId = "claude-code";
+    const filtered = applySyncScope(
+      snap,
+      scope({
+        excludedPlugins: new Set(["jira"]),
+        excludedSettingKeys: new Set(["defaultProviderId"]),
+      }),
+    );
+    expect(filtered.plugins.map((p) => p.id)).toEqual(["tasks"]);
+    expect(filtered.pluginSettings.map((e) => `${e.id}.${e.key}`)).toEqual([
+      "tasks.view",
+    ]);
+    expect(filtered.settings.generalSettings.defaultProviderId).toBeUndefined();
+  });
+
+  it("push merge preserves remote values outside the local scope", () => {
+    const remote = snapshot({
+      plugins: [{ id: "jira", install: "jira@bb-community", enabled: true }],
+      marketplaces: [{ name: "acme", source: "https://acme/m.json" }],
+    });
+    remote.settings.generalSettings.defaultProviderId = "claude-code";
+    remote.settings.generalSettings.managedBranchPrefix = "acme/";
+    const localBase = snapshot({
+      plugins: [{ id: "tasks", install: "builtin:tasks", enabled: true }],
+    });
+    localBase.settings.generalSettings.managedBranchPrefix = "bb/";
+    const local = applySyncScope(
+      localBase,
+      scope({
+        syncMarketplaces: false,
+        excludedPlugins: new Set(["jira"]),
+        excludedSettingKeys: new Set(["defaultProviderId"]),
+      }),
+    );
+    const merged = mergePresetForPush(
+      local,
+      remote,
+      scope({
+        syncMarketplaces: false,
+        excludedPlugins: new Set(["jira"]),
+        excludedSettingKeys: new Set(["defaultProviderId"]),
+      }),
+    );
+    // In-scope plugin captured, excluded remote plugin preserved
+    expect(merged.plugins.map((p) => p.id).sort()).toEqual(["jira", "tasks"]);
+    // Disabled category keeps remote values
+    expect(merged.marketplaces).toEqual(remote.marketplaces);
+    // Excluded key preserved from remote, in-scope key from local
+    expect(merged.settings.generalSettings.defaultProviderId).toBe("claude-code");
+    expect(merged.settings.generalSettings.managedBranchPrefix).toBe("bb/");
   });
 });
