@@ -424,3 +424,51 @@ describe("manifest comparison and merge", () => {
     ).toEqual(["plug"]);
   });
 });
+
+describe("exportVendoredToRepo", () => {
+  it("writes byte-exact payloads plus a -text gitattributes", async () => {
+    const { exportVendoredToRepo } = await import("../lib/vendor");
+    const { createHash } = await import("node:crypto");
+    const repo = await makeDir();
+    const source = await makeDir();
+    // CRLF bytes must be preserved verbatim — text conversion is disabled.
+    const crlfContent = "line1\r\nline2\r\n";
+    await write(source, "SKILL.md", crlfContent);
+    const sha = createHash("sha256")
+      .update(Buffer.from(crlfContent, "utf8"))
+      .digest("hex");
+    const manifest = {
+      schemaVersion: 1 as const,
+      collections: [
+        {
+          id: "skills",
+          kind: "files" as const,
+          repoDir: "vendored/files/skills",
+          target: "~/.agents/skills",
+          hash: `sha256:${sha}`,
+          fileCount: 1,
+          bytes: crlfContent.length,
+          entries: [
+            { path: "SKILL.md", size: crlfContent.length, sha256: sha },
+          ],
+        },
+      ],
+    };
+    const result = await exportVendoredToRepo({
+      repoDir: repo,
+      manifest,
+      sourceDirs: new Map([["skills", source]]),
+    });
+    expect(result.errors).toEqual([]);
+    expect(result.copied).toBe(1);
+    const payload = await readFile(
+      join(repo, "vendored", "files", "skills", "SKILL.md"),
+    );
+    expect(payload.toString("utf8")).toBe(crlfContent);
+    const attributes = await readFile(
+      join(repo, "vendored", ".gitattributes"),
+      "utf8",
+    );
+    expect(attributes).toContain("-text");
+  });
+});

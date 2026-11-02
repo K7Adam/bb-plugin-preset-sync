@@ -93,6 +93,7 @@ const IGNORED_NAMES = new Set([
   ".hg",
   ".svn",
   ".DS_Store",
+  ".trash",
   "Thumbs.db",
   "desktop.ini",
   "node_modules",
@@ -664,6 +665,15 @@ export async function exportVendoredToRepo(args: {
     args.manifest.collections
       .map((collection) => collection.repoDir)
       .filter(isValidVendoredRepoDir),
+  );
+
+  // Payloads are sha256-verified on pull — forbid text conversion so clones
+  // on any autocrlf setting hand back the exact committed bytes.
+  await mkdir(vendoredRoot, { recursive: true });
+  await writeFile(
+    join(vendoredRoot, ".gitattributes"),
+    "* -text\n",
+    "utf8",
   );
 
   for (const collection of args.manifest.collections) {

@@ -141,6 +141,16 @@ async function withClone<T>(
       ["clone", "--quiet", "--single-branch", "--branch", branch, repositoryUrl, repoDir],
       options,
     );
+    // Vendored payloads are sha256-verified on pull — the clone must hand back
+    // the exact bytes that were committed, regardless of the user's global
+    // autocrlf/eol settings.
+    await runGit(
+      ["config", "core.autocrlf", "false"],
+      { ...options, cwd: repoDir },
+    ).catch(() => undefined);
+    await runGit(["config", "core.eol", "lf"], { ...options, cwd: repoDir }).catch(
+      () => undefined,
+    );
     return await operation(repoDir);
   } finally {
     // Windows: a just-exited git child or AV scan can hold .git handles briefly;
