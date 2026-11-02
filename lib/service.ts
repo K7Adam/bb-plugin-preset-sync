@@ -601,6 +601,7 @@ export class PresetSyncService {
           for (const entry of entries) {
             const descriptor = response.schema[entry.key];
             if (
+              entry.value === null ||
               descriptor === undefined ||
               ("secret" in descriptor && descriptor.secret === true) ||
               settingSafetyIssue(entry.key, entry.value) !== null ||

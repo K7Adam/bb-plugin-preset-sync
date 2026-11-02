@@ -1,12 +1,12 @@
 {
   "sdkMajor": 0,
-  "sdkVersion": "0.6.104",
+  "sdkVersion": "0.6.109",
   "artifactFormatVersion": 1,
   "pluginId": "preset-sync",
   "pluginVersion": "0.2.2",
   "builtWith": {
-    "bbVersion": "0.48.2-nightly.40981326765.1",
-    "pluginSdkVersion": "0.6.104"
+    "bbVersion": "0.48.2-nightly.41329093127.1",
+    "pluginSdkVersion": "0.6.109"
   },
   "runtimeSlots": [
     "classVarianceAuthority",

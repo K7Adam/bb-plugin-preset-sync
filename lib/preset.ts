@@ -35,37 +35,59 @@ const keybindingOverrideSchema = z
   })
   .strict();
 
+function dropNullishFields(value: unknown): unknown {
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).filter(
+        ([, v]) => v != null,
+      ),
+    );
+  }
+  return value;
+}
+
 export const settingsPresetSchema = z
   .object({
     generalSettings: z
       .object({
-        defaultProviderId: z.string().nullable(),
-        providerOrder: z.array(z.string()),
-        showKeyboardHints: z.boolean(),
-        showUnhandledProviderEvents: z.boolean(),
-        steerActiveThreadOnEnter: z.boolean(),
-        streamerMode: z.boolean(),
-        terminalCopyOnSelect: z.boolean().optional(),
-        confirmThreadArchive: z.boolean().optional(),
-        showDiagnosticEvents: z.boolean().optional(),
-        keepHistoryAfterContextClear: z.boolean().optional(),
-        summarizeShellCommands: z.boolean().optional(),
-        providerCompletedTurnDisplay: z.record(z.string(), z.string()).optional(),
-        allowFastServiceTier: z.boolean().optional(),
-        telemetryEnabled: z.boolean().optional(),
-        managedBranchPrefix: z.string().optional(),
-        idleProviderSessionTimeoutMinutes: z.number().optional(),
-        defaultMachineAccess: z.string().optional(),
-        earlyAdopter: z.boolean().optional(),
-      }),
-    experiments: z.record(z.string(), z.boolean()),
-    keybindingOverrides: z.array(keybindingOverrideSchema),
-    appearance: z
-      .object({
-        themeId: z.string().min(1),
-        faviconColor: faviconColorSchema,
+        defaultProviderId: z.string().nullish(),
+        providerOrder: z.array(z.string()).nullish(),
+        showKeyboardHints: z.boolean().nullish(),
+        showUnhandledProviderEvents: z.boolean().nullish(),
+        steerActiveThreadOnEnter: z.boolean().nullish(),
+        streamerMode: z.boolean().nullish(),
+        terminalCopyOnSelect: z.boolean().nullish(),
+        confirmThreadArchive: z.boolean().nullish(),
+        showDiagnosticEvents: z.boolean().nullish(),
+        keepHistoryAfterContextClear: z.boolean().nullish(),
+        summarizeShellCommands: z.boolean().nullish(),
+        providerCompletedTurnDisplay: z
+          .record(z.string(), z.string().nullable())
+          .nullish(),
+        allowFastServiceTier: z.boolean().nullish(),
+        telemetryEnabled: z.boolean().nullish(),
+        managedBranchPrefix: z.string().nullish(),
+        idleProviderSessionTimeoutMinutes: z.number().nullish(),
+        defaultMachineAccess: z.string().nullish(),
+        earlyAdopter: z.boolean().nullish(),
       })
-      .strict(),
+      .nullish()
+      .transform((v) => v ?? {}),
+    experiments: z
+      .record(z.string(), z.boolean().nullable())
+      .nullish()
+      .transform((v) => v ?? {}),
+    keybindingOverrides: z
+      .array(keybindingOverrideSchema)
+      .nullish()
+      .transform((v) => (v ?? []).filter((e) => e != null)),
+    appearance: z.preprocess(
+      (v) => dropNullishFields(v ?? {}),
+      z.object({
+        themeId: z.string().min(1).default("default"),
+        faviconColor: faviconColorSchema.default("default"),
+      }),
+    ),
   })
   .strict();
 
@@ -88,7 +110,7 @@ export const pluginSettingPresetEntrySchema = z
   .object({
     id: z.string().min(1),
     key: z.string().min(1),
-    value: z.union([z.string(), z.boolean()]),
+    value: z.union([z.string(), z.boolean(), z.null()]),
   })
   .strict();
 
@@ -505,7 +527,7 @@ function inspectSettingValue(value: unknown): "credential-like data" | "machine-
 
 export function settingSafetyIssue(
   key: string,
-  value: string | boolean,
+  value: string | boolean | null,
 ): "credential-like key" | "credential-like data" | "machine-local path" | null {
   if (isSensitiveSettingKey(key)) return "credential-like key";
   return inspectSettingValue(value);
