@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, cp, mkdtemp, rm } from "node:fs/promises";
+import { lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -11,6 +12,14 @@ import {
   writePresetSnapshot,
   type PresetSnapshot,
 } from "./preset";
+import {
+  VENDORED_REPO_DIR,
+  exportVendoredToRepo,
+  readVendoredManifest,
+  sameVendoredManifest,
+  writeVendoredManifest,
+  type VendoredManifest,
+} from "./vendor";
 
 const execFileAsync = promisify(execFile);
 const MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024;
@@ -171,21 +180,65 @@ export async function readExistingPreset(
 }
 
 export async function readRemotePreset(
-  options: GitRepositoryOptions,
-): Promise<{ snapshot: PresetSnapshot; head: string }> {
+  options: GitRepositoryOptions & { copyVendoredTo?: string },
+): Promise<{
+  snapshot: PresetSnapshot;
+  head: string;
+  vendored: VendoredManifest;
+  vendoredWarning?: string;
+}> {
   return withClone(options, async (repoDir) => {
-    const [snapshot, head] = await Promise.all([
+    const [snapshot, head, vendored] = await Promise.all([
       readPresetSnapshot(repoDir),
       runGit(["rev-parse", "HEAD"], { ...options, cwd: repoDir }),
+      readVendoredManifest(repoDir).catch((cause) => ({
+        warning: `vendored.json could not be read (${errorMessage(cause)}); vendored payloads will be skipped.`,
+        manifest: null,
+      })),
     ]);
-    return { snapshot, head };
+    const vendoredWarning =
+      vendored !== null && "warning" in vendored
+        ? vendored.warning
+        : undefined;
+    const vendoredManifest =
+      vendored !== null && "warning" in vendored
+        ? { schemaVersion: 1 as const, collections: [] }
+        : vendored;
+    if (
+      options.copyVendoredTo !== undefined &&
+      vendoredManifest.collections.length > 0
+    ) {
+      await cp(join(repoDir, VENDORED_REPO_DIR), options.copyVendoredTo, {
+        recursive: true,
+        // Vendored payloads must be regular files; symlinks are filtered out
+        // entirely (also avoids Windows privilege requirements).
+        dereference: false,
+        verbatimSymlinks: true,
+        filter: (source) => {
+          try {
+            return !lstatSync(source).isSymbolicLink();
+          } catch {
+            return false;
+          }
+        },
+      }).catch(() => undefined);
+      // A missing vendored/ directory is tolerated; materialization verifies
+      // each manifest entry against real files and reports gaps.
+    }
+    return { snapshot, head, vendored: vendoredManifest, vendoredWarning };
   });
 }
 
 export async function pushRemotePreset(
   options: GitPushOptions,
   snapshot: PresetSnapshot,
-): Promise<{ pushed: boolean; head: string; changedFiles: string[] }> {
+  vendored?: { manifest: VendoredManifest; sourceDirs: Map<string, string> },
+): Promise<{
+  pushed: boolean;
+  head: string;
+  changedFiles: string[];
+  vendoredErrors: string[];
+}> {
   const branch = validateBranch(options.branch);
   const authorName = options.authorName.trim();
   const authorEmail = options.authorEmail.trim();
@@ -201,19 +254,45 @@ export async function pushRemotePreset(
   }
 
   return withClone(options, async (repoDir) => {
-    const [existing, existingHead] = await Promise.all([
+    const [existing, existingHead, existingVendored] = await Promise.all([
       readExistingPreset(repoDir),
       runGit(["rev-parse", "HEAD"], { ...options, cwd: repoDir }),
+      readVendoredManifest(repoDir).catch(() => null),
     ]);
-    if (existing !== null && samePresetConfiguration(existing, snapshot)) {
-      return { pushed: false, head: existingHead, changedFiles: [] };
+    const vendoredManifest = vendored?.manifest ?? {
+      schemaVersion: 1 as const,
+      collections: [],
+    };
+    if (
+      existing !== null &&
+      samePresetConfiguration(existing, snapshot) &&
+      vendored !== undefined &&
+      existingVendored !== null &&
+      sameVendoredManifest(existingVendored, vendoredManifest)
+    ) {
+      return { pushed: false, head: existingHead, changedFiles: [], vendoredErrors: [] };
     }
 
     await writePresetSnapshot(repoDir, snapshot);
-    const status = await runGit(["status", "--porcelain=v1", "--", "preset"], {
-      ...options,
-      cwd: repoDir,
-    });
+    await writeVendoredManifest(repoDir, vendoredManifest);
+    const vendoredErrors: string[] = [];
+    if (vendored !== undefined) {
+      const exported = await exportVendoredToRepo({
+        repoDir,
+        manifest: vendoredManifest,
+        sourceDirs: vendored.sourceDirs,
+      });
+      vendoredErrors.push(...exported.errors);
+    } else {
+      await rm(join(repoDir, VENDORED_REPO_DIR), {
+        recursive: true,
+        force: true,
+      });
+    }
+    const status = await runGit(
+      ["status", "--porcelain=v1", "--", "preset", VENDORED_REPO_DIR],
+      { ...options, cwd: repoDir },
+    );
     const changedFiles = status
       .split("\n")
       .map((line) => line.slice(3).trim())
@@ -223,10 +302,11 @@ export async function pushRemotePreset(
         pushed: false,
         head: existingHead,
         changedFiles,
+        vendoredErrors,
       };
     }
 
-    await runGit(["add", "--", ...MANAGED_PRESET_FILES], {
+    await runGit(["add", "--", ...MANAGED_PRESET_FILES, VENDORED_REPO_DIR], {
       ...options,
       cwd: repoDir,
     });
@@ -251,6 +331,7 @@ export async function pushRemotePreset(
       pushed: true,
       head: await runGit(["rev-parse", "HEAD"], { ...options, cwd: repoDir }),
       changedFiles,
+      vendoredErrors,
     };
   });
 }

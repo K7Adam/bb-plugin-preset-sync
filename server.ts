@@ -54,6 +54,8 @@ const usage = [
   "",
   "Pull is additive: local plugins absent from the preset are kept.",
   "Secret settings, credentials, sessions, and runtime data are never captured.",
+  "Local-path plugins and configured home directories (skills, prompts) are",
+  "vendored into the preset; pull materializes them without deleting extras.",
 ].join("\n");
 
 function planText(plan: SyncPlan): string {
@@ -67,6 +69,11 @@ function planText(plan: SyncPlan): string {
   }
   for (const warning of plan.warnings) lines.push(`  ! ${warning}`);
   return lines.join("\n");
+}
+
+function parsePositiveInt(value: string | boolean | undefined, fallback: number): number {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function parseMessage(argv: string[]): { ok: true; message?: string } | { ok: false } {
@@ -159,11 +166,75 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Sync theme and favicon color.",
       default: true,
     },
+    syncVendoredPlugins: {
+      type: "boolean",
+      label: "Vendor local-path plugins",
+      description:
+        "Copy plugins installed from a local path: into the preset so other machines install them from vendored files (installed under ~/.bb/preset-vendored).",
+      default: true,
+    },
+    syncVendoredFiles: {
+      type: "boolean",
+      label: "Sync vendored file collections",
+      description:
+        "Sync the directories listed below into the preset and materialize them on machines that pull.",
+      default: true,
+    },
+    vendoredPaths: {
+      type: "string",
+      label: "Vendored directories",
+      description:
+        "Comma- or newline-separated directories synced as file collections. Only paths inside your home folder are portable (~ expands per machine). Skills, prompts and other agent config live well here.",
+      default: "~/.agents/skills\n~/.claude/skills",
+      experimental_multiline: true,
+    },
+    vendorExcludeGlobs: {
+      type: "string",
+      label: "Vendored exclude globs",
+      description:
+        "Extra comma-separated glob patterns skipped while vendoring (matched against collection-relative paths). node_modules, .git, VCS metadata, OS noise and credential-like file names are always excluded.",
+      default: "",
+      experimental_multiline: true,
+    },
+    vendorConflictMode: {
+      type: "select",
+      label: "File conflict mode",
+      description:
+        "What pull does when a vendored file differs from the local copy: backup copies the local file aside first, overwrite replaces it, skip keeps it.",
+      options: ["backup", "overwrite", "skip"],
+      default: "backup",
+    },
+    vendorPruneExtras: {
+      type: "boolean",
+      label: "Prune extra files",
+      description:
+        "Remove files inside vendored collection targets that the preset no longer contains. Extras are moved to ~/.bb/preset-vendored/trash, never deleted outright.",
+      default: false,
+    },
+    vendorNpmInstall: {
+      type: "boolean",
+      label: "Prepare vendored plugins",
+      description:
+        "Run npm ci/install inside a vendored plugin when it ships a package.json but no node_modules, so dependencies resolve after pull.",
+      default: true,
+    },
+    vendorMaxFileKb: {
+      type: "string",
+      label: "Max vendored file size (KB)",
+      description: "Files larger than this are skipped while vendoring.",
+      default: "512",
+    },
+    vendorMaxCollectionMb: {
+      type: "string",
+      label: "Max collection size (MB)",
+      description: "Total bytes per vendored collection before files are skipped.",
+      default: "50",
+    },
     excludedPlugins: {
       type: "string",
       label: "Excluded plugins",
       description:
-        "Comma-separated plugin IDs left unmanaged: never captured, installed, enabled, disabled, or configured from the preset.",
+        "Comma-separated plugin IDs left unmanaged: never captured, vendored, installed, enabled, disabled, or configured from the preset.",
       default: "",
     },
     excludedSettingKeys: {
@@ -198,6 +269,15 @@ export default async function plugin(bb: BbPluginApi) {
       syncExperiments: value.syncExperiments,
       syncKeybindings: value.syncKeybindings,
       syncAppearance: value.syncAppearance,
+      syncVendoredPlugins: value.syncVendoredPlugins ?? true,
+      syncVendoredFiles: value.syncVendoredFiles ?? true,
+      vendoredPaths: value.vendoredPaths ?? "",
+      vendorExcludeGlobs: value.vendorExcludeGlobs ?? "",
+      vendorConflictMode: value.vendorConflictMode ?? "backup",
+      vendorPruneExtras: value.vendorPruneExtras ?? false,
+      vendorNpmInstall: value.vendorNpmInstall ?? true,
+      vendorMaxFileKb: parsePositiveInt(value.vendorMaxFileKb, 512),
+      vendorMaxCollectionMb: parsePositiveInt(value.vendorMaxCollectionMb, 50),
       excludedPlugins: value.excludedPlugins ?? "",
       excludedSettingKeys: value.excludedSettingKeys ?? "",
       excludedPluginSettingKeys: value.excludedPluginSettingKeys ?? "",
@@ -285,8 +365,12 @@ export default async function plugin(bb: BbPluginApi) {
           }
           case "capture": {
             const captured = await service.capture();
+            const vendored =
+              captured.vendoredCount > 0
+                ? `, ${captured.vendoredCount} vendored ${captured.vendoredCount === 1 ? "collection" : "collections"} (${captured.vendoredFileCount} files)`
+                : "";
             const text = [
-              `Captured ${captured.pluginCount} plugins, ${captured.pluginSettingCount} non-secret plugin settings, and ${captured.marketplaceCount} marketplaces.`,
+              `Captured ${captured.pluginCount} plugins, ${captured.pluginSettingCount} non-secret plugin settings, ${captured.marketplaceCount} marketplaces${vendored}.`,
               `Staged at ${captured.capturedAt}.`,
               ...captured.warnings.map((warning) => `  ! ${warning}`),
             ].join("\n");

@@ -1,6 +1,12 @@
 import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { z } from "zod";
+import {
+  EMPTY_VENDORED_MANIFEST,
+  vendoredPluginId,
+  type VendoredManifest,
+  type VendorAppliedState,
+} from "./vendor";
 
 export const PRESET_SCHEMA_VERSION = 1 as const;
 export const SELF_PLUGIN_ID = "preset-sync";
@@ -110,7 +116,7 @@ export const pluginSettingPresetEntrySchema = z
   .object({
     id: z.string().min(1),
     key: z.string().min(1),
-    value: z.union([z.string(), z.boolean(), z.null()]),
+    value: z.union([z.string(), z.boolean(), z.number(), z.null()]),
   })
   .strict();
 
@@ -143,6 +149,7 @@ export const planChangeSchema = z
       "experiments",
       "keybindings",
       "appearance",
+      "vendored",
       "metadata",
     ]),
     action: z.enum(["add", "remove", "install", "enable", "disable", "update"]),
@@ -209,6 +216,8 @@ export const captureResultSchema = z
     pluginCount: z.number().int().nonnegative(),
     pluginSettingCount: z.number().int().nonnegative(),
     marketplaceCount: z.number().int().nonnegative(),
+    vendoredCount: z.number().int().nonnegative().default(0),
+    vendoredFileCount: z.number().int().nonnegative().default(0),
     warnings: z.array(z.string()),
   })
   .strict();
@@ -275,11 +284,12 @@ export const MANAGED_PRESET_FILES = [
   "preset/marketplaces.json",
   "preset/plugin-settings.json",
   "preset/metadata.json",
+  "preset/vendored.json",
 ] as const;
 
 async function assertPresetPathsSafe(repoDir: string): Promise<void> {
   const root = resolve(repoDir);
-  for (const relativePath of ["preset", ...MANAGED_PRESET_FILES]) {
+  for (const relativePath of ["preset", "vendored", ...MANAGED_PRESET_FILES]) {
     const target = resolve(root, relativePath);
     if (target !== root && !target.startsWith(`${root}${sep}`)) {
       throw new Error(`Preset path escapes the repository: ${relativePath}`);
@@ -478,6 +488,8 @@ export interface SyncScope {
   syncKeybindings: boolean;
   syncAppearance: boolean;
   syncPluginSettings: boolean;
+  syncVendoredPlugins: boolean;
+  syncVendoredFiles: boolean;
   excludedPlugins: ReadonlySet<string>;
   excludedSettingKeys: ReadonlySet<string>;
   excludedPluginSettingKeys: ReadonlySet<string>;
@@ -491,6 +503,8 @@ export const FULL_SYNC_SCOPE: SyncScope = {
   syncKeybindings: true,
   syncAppearance: true,
   syncPluginSettings: true,
+  syncVendoredPlugins: true,
+  syncVendoredFiles: true,
   excludedPlugins: new Set(),
   excludedSettingKeys: new Set(),
   excludedPluginSettingKeys: new Set(),
@@ -704,7 +718,7 @@ function inspectSettingValue(value: unknown): "credential-like data" | "machine-
 
 export function settingSafetyIssue(
   key: string,
-  value: string | boolean | null,
+  value: string | boolean | number | null,
 ): "credential-like key" | "credential-like data" | "machine-local path" | null {
   if (isSensitiveSettingKey(key)) return "credential-like key";
   return inspectSettingValue(value);
@@ -757,11 +771,20 @@ export function buildPullPlan(args: {
   remoteHead: string;
   local: PresetSnapshot;
   remote: PresetSnapshot;
+  remoteVendored?: VendoredManifest;
+  appliedVendored?: VendorAppliedState;
   warnings?: string[];
 }): SyncPlan {
   const { repository, branch, remoteHead } = args;
   const local = sortSnapshot(args.local);
   const remote = sortSnapshot(args.remote);
+  const remoteVendored = args.remoteVendored ?? EMPTY_VENDORED_MANIFEST;
+  const appliedVendored = args.appliedVendored ?? { collections: {} };
+  const vendoredPluginCollections = new Map(
+    remoteVendored.collections
+      .filter((entry) => entry.kind === "plugin" && entry.pluginId !== undefined)
+      .map((entry) => [entry.pluginId!, entry]),
+  );
   const changes: PlanChange[] = [];
   const warnings = [...(args.warnings ?? [])];
 
@@ -796,18 +819,48 @@ export function buildPullPlan(args: {
   for (const plugin of remote.plugins) {
     if (plugin.id === SELF_PLUGIN_ID) continue;
     const current = localPlugins.get(plugin.id);
+    const vendoredCollection = vendoredPluginCollections.get(plugin.id);
     if (current === undefined) {
-      if (!isPortableInstallSource(plugin.install)) {
+      if (vendoredPluginId(plugin.install) !== null) {
+        if (vendoredCollection === undefined) {
+          warnings.push(
+            `Plugin ${plugin.id} is vendored but the preset is missing its payload; it will be skipped.`,
+          );
+          continue;
+        }
+        changes.push({
+          kind: "plugin-install",
+          action: "install",
+          target: plugin.id,
+          summary: `Install ${plugin.id} from vendored files (${vendoredCollection.fileCount} files)`,
+          risk: "full-trust",
+        });
+      } else if (!isPortableInstallSource(plugin.install)) {
         warnings.push(
           `Plugin ${plugin.id} uses a machine-local source and will be skipped.`,
         );
         continue;
+      } else {
+        changes.push({
+          kind: "plugin-install",
+          action: "install",
+          target: plugin.id,
+          summary: `Install ${plugin.id} from ${plugin.install}`,
+          risk: "full-trust",
+        });
       }
+    } else if (
+      vendoredPluginId(plugin.install) !== null &&
+      current.install === plugin.install &&
+      vendoredCollection !== undefined &&
+      appliedVendored.collections[vendoredCollection.id]?.hash !==
+        vendoredCollection.hash
+    ) {
       changes.push({
-        kind: "plugin-install",
-        action: "install",
+        kind: "vendored",
+        action: "update",
         target: plugin.id,
-        summary: `Install ${plugin.id} from ${plugin.install}`,
+        summary: `Update vendored plugin ${plugin.id} (${vendoredCollection.fileCount} files)`,
         risk: "full-trust",
       });
     } else if (current.install !== plugin.install) {
@@ -831,6 +884,19 @@ export function buildPullPlan(args: {
         `Local plugin ${plugin.id} is not in the preset and will be kept installed.`,
       );
     }
+  }
+
+  for (const collection of remoteVendored.collections) {
+    if (collection.kind !== "files") continue;
+    const applied = appliedVendored.collections[collection.id];
+    if (applied?.hash === collection.hash) continue;
+    changes.push({
+      kind: "vendored",
+      action: applied === undefined ? "add" : "update",
+      target: collection.id,
+      summary: `${applied === undefined ? "Sync" : "Update"} ${collection.fileCount} ${plural(collection.fileCount, "file", "files")} to ${collection.target}`,
+      risk: "configuration",
+    });
   }
 
   const localSettingValues = new Map(
@@ -927,6 +993,7 @@ function sortedKeys<T>(left: Map<string, T>, right: Map<string, T>): string[] {
 export function buildPushChanges(
   localSnapshot: PresetSnapshot,
   remoteSnapshot: PresetSnapshot,
+  vendored?: { local?: VendoredManifest; remote?: VendoredManifest },
 ): PlanChange[] {
   const local = sortSnapshot(localSnapshot);
   const remote = sortSnapshot(remoteSnapshot);
@@ -1096,6 +1163,52 @@ export function buildPushChanges(
       summary: `Record BB ${local.bbVersion} in preset metadata`,
       risk: "configuration",
     });
+  }
+
+  if (vendored !== undefined) {
+    const localCollections = new Map(
+      (vendored.local?.collections ?? []).map((entry) => [entry.id, entry]),
+    );
+    const remoteCollections = new Map(
+      (vendored.remote?.collections ?? []).map((entry) => [entry.id, entry]),
+    );
+    for (const id of sortedKeys(localCollections, remoteCollections)) {
+      const next = localCollections.get(id);
+      const current = remoteCollections.get(id);
+      const label =
+        (next ?? current)?.kind === "plugin"
+          ? `vendored plugin ${(next ?? current)?.pluginId ?? id}`
+          : `vendored files ${id}`;
+      if (next !== undefined && current === undefined) {
+        changes.push({
+          kind: "vendored",
+          action: "add",
+          target: id,
+          summary: `Add ${label} to the preset (${next.fileCount} files)`,
+          risk: "configuration",
+        });
+      } else if (next === undefined && current !== undefined) {
+        changes.push({
+          kind: "vendored",
+          action: "remove",
+          target: id,
+          summary: `Remove ${label} from the preset`,
+          risk: "configuration",
+        });
+      } else if (
+        next !== undefined &&
+        current !== undefined &&
+        next.hash !== current.hash
+      ) {
+        changes.push({
+          kind: "vendored",
+          action: "update",
+          target: id,
+          summary: `Update ${label} in the preset (${next.fileCount} files)`,
+          risk: "configuration",
+        });
+      }
+    }
   }
 
   return changes.map((change) => planChangeSchema.parse(change));

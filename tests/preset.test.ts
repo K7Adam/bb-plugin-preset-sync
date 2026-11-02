@@ -8,6 +8,7 @@ import {
   isPortableInstallSource,
   isSensitiveSettingKey,
   parseCatalogInstallSource,
+  pluginSettingPresetEntrySchema,
   readPresetSnapshot,
   samePresetConfiguration,
   writePresetSnapshot,
@@ -19,6 +20,7 @@ import {
   type PresetSnapshot,
   type SyncScope,
 } from "../lib/preset";
+import type { VendoredManifest } from "../lib/vendor";
 
 const temporaryDirectories: string[] = [];
 
@@ -202,6 +204,172 @@ describe("preset safety", () => {
     await expect(readPresetSnapshot(directory)).rejects.toThrow(
       "Preset path must not be a symbolic link: preset/settings.json",
     );
+  });
+});
+
+describe("vendored pull plan", () => {
+  const pluginPayload = (id: string, hash = "h1"): VendoredManifest => ({
+    schemaVersion: 1,
+    collections: [
+      {
+        id,
+        kind: "plugin",
+        pluginId: id,
+        repoDir: `vendored/plugins/${id}`,
+        hash,
+        fileCount: 12,
+        bytes: 4096,
+        entries: [],
+      },
+    ],
+  });
+  const filesPayload = (id: string, hash = "h1"): VendoredManifest => ({
+    schemaVersion: 1,
+    collections: [
+      {
+        id,
+        kind: "files",
+        repoDir: `vendored/files/${id}`,
+        target: "~/.agents/skills",
+        hash,
+        fileCount: 7,
+        bytes: 2048,
+        entries: [],
+      },
+    ],
+  });
+
+  it("plans a vendored plugin install instead of skipping it", () => {
+    const remote = snapshot({
+      plugins: [{ id: "wip", install: "vendored:wip", enabled: true }],
+    });
+    const plan = buildPullPlan({
+      repository: "https://github.com/example/preset.git",
+      branch: "main",
+      remoteHead: "abc",
+      local: snapshot(),
+      remote,
+      remoteVendored: pluginPayload("wip"),
+    });
+    expect(plan.changes).toContainEqual(
+      expect.objectContaining({
+        kind: "plugin-install",
+        action: "install",
+        target: "wip",
+        summary: "Install wip from vendored files (12 files)",
+      }),
+    );
+  });
+
+  it("skips vendored installs whose payload is missing", () => {
+    const remote = snapshot({
+      plugins: [{ id: "wip", install: "vendored:wip", enabled: true }],
+    });
+    const plan = buildPullPlan({
+      repository: "https://github.com/example/preset.git",
+      branch: "main",
+      remoteHead: "abc",
+      local: snapshot(),
+      remote,
+    });
+    expect(plan.changes).toHaveLength(0);
+    expect(
+      plan.warnings.some((warning) => warning.includes("missing its payload")),
+    ).toBe(true);
+  });
+
+  it("plans vendored plugin updates by content hash", () => {
+    const remote = snapshot({
+      plugins: [{ id: "wip", install: "vendored:wip", enabled: true }],
+    });
+    const local = snapshot({
+      plugins: [{ id: "wip", install: "vendored:wip", enabled: true }],
+    });
+    const stale = buildPullPlan({
+      repository: "https://github.com/example/preset.git",
+      branch: "main",
+      remoteHead: "abc",
+      local,
+      remote,
+      remoteVendored: pluginPayload("wip", "new-hash"),
+      appliedVendored: {
+        collections: { wip: { hash: "old-hash", appliedAt: "x" } },
+      },
+    });
+    expect(stale.changes).toContainEqual(
+      expect.objectContaining({ kind: "vendored", target: "wip" }),
+    );
+
+    const current = buildPullPlan({
+      repository: "https://github.com/example/preset.git",
+      branch: "main",
+      remoteHead: "abc",
+      local,
+      remote,
+      remoteVendored: pluginPayload("wip", "same-hash"),
+      appliedVendored: {
+        collections: { wip: { hash: "same-hash", appliedAt: "x" } },
+      },
+    });
+    expect(current.changes.filter((c) => c.kind === "vendored")).toHaveLength(0);
+  });
+
+  it("plans file collection syncs only when not yet applied", () => {
+    const remote = snapshot();
+    const pending = buildPullPlan({
+      repository: "https://github.com/example/preset.git",
+      branch: "main",
+      remoteHead: "abc",
+      local: snapshot(),
+      remote,
+      remoteVendored: filesPayload("agents-skills"),
+    });
+    expect(pending.changes).toContainEqual(
+      expect.objectContaining({
+        kind: "vendored",
+        summary: "Sync 7 files to ~/.agents/skills",
+      }),
+    );
+
+    const done = buildPullPlan({
+      repository: "https://github.com/example/preset.git",
+      branch: "main",
+      remoteHead: "abc",
+      local: snapshot(),
+      remote,
+      remoteVendored: filesPayload("agents-skills"),
+      appliedVendored: {
+        collections: {
+          "agents-skills": { hash: "h1", appliedAt: "x" },
+        },
+      },
+    });
+    expect(done.changes).toHaveLength(0);
+  });
+
+  it("describes vendored changes in the push direction", () => {
+    const local = pluginPayload("wip", "new-hash");
+    const remote = pluginPayload("wip", "old-hash");
+    const changes = buildPushChanges(snapshot(), snapshot(), {
+      local,
+      remote,
+    });
+    expect(changes).toContainEqual(
+      expect.objectContaining({
+        kind: "vendored",
+        action: "update",
+        target: "wip",
+      }),
+    );
+  });
+
+  it("round-trips number plugin settings through the preset schema", () => {
+    const parsed = pluginSettingPresetEntrySchema.parse({
+      id: "agent-usage",
+      key: "overlayRefreshMinutes",
+      value: 3,
+    });
+    expect(parsed.value).toBe(3);
   });
 });
 

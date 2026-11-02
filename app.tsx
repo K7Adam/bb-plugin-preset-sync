@@ -205,7 +205,10 @@ function PresetSyncSettings() {
     try {
       const result: CaptureResult = await rpc.call("sync_capture");
       setNotice(
-        `Staged ${result.pluginCount} plugins and ${result.pluginSettingCount} non-secret plugin settings.`,
+        `Staged ${result.pluginCount} plugins and ${result.pluginSettingCount} non-secret plugin settings.` +
+          (result.vendoredCount > 0
+            ? ` Vendored ${result.vendoredCount} collections (${result.vendoredFileCount} files).`
+            : ""),
       );
       setError(null);
       await refreshStatus();
