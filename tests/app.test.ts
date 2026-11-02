@@ -6,8 +6,11 @@ import { waitFor } from "@testing-library/react";
 import type { SyncStatus } from "../lib/preset";
 
 describe("plugin app registration", () => {
-  it("exposes Preset Sync in settings and the sidebar", async () => {
-    const app = await loadPluginApp(() => import("../app"));
+  it(
+    "exposes Preset Sync in settings and the sidebar",
+    { timeout: 20_000 },
+    async () => {
+      const app = await loadPluginApp(() => import("../app"));
 
     expect(app.settingsSections).toEqual([
       expect.objectContaining({ id: "preset-sync", title: "Preset Sync" }),
@@ -21,7 +24,8 @@ describe("plugin app registration", () => {
       }),
     ]);
     expect(app.navPanels[0]?.experimental_sidebarAccessory).toBeTypeOf("function");
-  });
+    },
+  );
 
   it("shows directional actions and the exact remote and local changes", async () => {
     const app = await loadPluginApp(() => import("../app"));

@@ -1004,6 +1004,19 @@ export class PresetSyncService {
           sourceDirs: rebuilt.sourceDirs,
         },
       );
+      // File collections just pushed were read from their own target dirs —
+      // record them as applied so pull plans do not flag this machine.
+      const pushedIds = new Set(
+        mergedVendored.map((collection) => collection.id),
+      );
+      for (const collection of rebuilt.collections) {
+        if (collection.kind !== "files" || !pushedIds.has(collection.id)) {
+          continue;
+        }
+        await recordVendorApplied(collection.id, {
+          hash: collection.hash,
+        }).catch(() => undefined);
+      }
       const at = new Date().toISOString();
       await this.writeLastOperation({
         type: "push",
