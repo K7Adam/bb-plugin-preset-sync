@@ -44,10 +44,11 @@ export async function installPluginFromPreset(
     if (unresolvedReason !== undefined) {
       throw new Error(unresolvedReason);
     }
-    return bb.sdk.plugins.catalog.install({
-      ...catalogTarget,
-      confirmedSource: plan.resolvedSource,
-    });
+    // BB accepts a confirmed source only for third-party marketplaces and
+    // refuses it for its own (bb-official, bb-community).
+    return bb.sdk.plugins.catalog.install(
+      plan.official ? catalogTarget : { ...catalogTarget, confirmedSource: plan.resolvedSource },
+    );
   }
 
   return bb.sdk.plugins.catalog.install(catalogTarget);

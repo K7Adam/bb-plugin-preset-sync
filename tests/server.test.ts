@@ -101,15 +101,16 @@ describe("plugin registration", () => {
     expect(backgroundIntervalMs("unexpected")).toBe(5 * 60_000);
   });
 
-  it("restores marketplace plugins through the catalog API", async () => {
-    const resolvedSource = {
-      kind: "git" as const,
-      url: "https://github.com/yusuf8834/bb-sidebar.git",
-      range: "^0.2.0",
-      resolvedCommit: "abc123",
-      resolvedTag: "v0.2.4",
-    };
-    const { bb, harness } = createFakePluginHost({
+  const resolvedSource = {
+    kind: "git" as const,
+    url: "https://github.com/yusuf8834/bb-sidebar.git",
+    range: "^0.2.0",
+    resolvedCommit: "abc123",
+    resolvedTag: "v0.2.4",
+  };
+
+  function catalogHost(official: boolean) {
+    return createFakePluginHost({
       pluginId: "preset-sync",
       sdk: {
         plugins: {
@@ -124,8 +125,8 @@ describe("plugin registration", () => {
               displayName: "BB Sidebar",
               source: `${entryId}@${marketplace}`,
               marketplace: marketplace ?? "bb-community",
-              marketplaceDisplayName: "BB Community",
-              official: true,
+              marketplaceDisplayName: official ? "BB Community" : "y5k",
+              official,
               author: { name: "Test", url: null },
               compatible: true,
               incompatibleReason: null,
@@ -136,6 +137,12 @@ describe("plugin registration", () => {
         },
       },
     });
+  }
+
+  // BB refuses confirmedSource for its own marketplaces ("install refused:
+  // confirmedSource applies only to third-party marketplaces", bb 0.48.2).
+  it("installs from BB's own marketplaces without a source confirmation", async () => {
+    const { bb, harness } = catalogHost(true);
 
     await installPluginFromPreset(bb, "bb-sidebar@bb-community");
 
@@ -148,6 +155,18 @@ describe("plugin registration", () => {
     expect(harness.inspection.sdk.callsTo("plugins.catalog.install")[0]?.[0]).toEqual({
       entryId: "bb-sidebar",
       marketplace: "bb-community",
+    });
+    await harness.lifecycle.dispose();
+  });
+
+  it("confirms the resolved source for third-party marketplaces", async () => {
+    const { bb, harness } = catalogHost(false);
+
+    await installPluginFromPreset(bb, "bb-sidebar@y5k");
+
+    expect(harness.inspection.sdk.callsTo("plugins.catalog.install")[0]?.[0]).toEqual({
+      entryId: "bb-sidebar",
+      marketplace: "y5k",
       confirmedSource: resolvedSource,
     });
     await harness.lifecycle.dispose();

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1
+
+- Install plugins from BB's own marketplaces (bb-official, bb-community)
+  without a source confirmation. BB accepts a confirmed source only for
+  third-party marketplaces and refused the install before.
+
 ## 0.4.0
 
 - Treat a skill as one unit: when any file of a skill changed on both sides,
