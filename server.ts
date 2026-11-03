@@ -10,9 +10,12 @@ import {
   syncPlanSchema,
   syncStatusSchema,
   SELF_PLUGIN_ID,
+  skillRuleSchema,
   type SyncPlan,
 } from "./lib/preset";
+import { PublishBlockedError, publishHitSchema } from "./lib/publish-guard";
 import { PresetSyncService } from "./lib/service";
+import { conflictDetailSchema, skillGroupsSchema, skillsOverviewSchema } from "./lib/skill-groups";
 
 export const rpcContract = defineRpcContract({
   sync_status: {
@@ -36,9 +39,37 @@ export const rpcContract = defineRpcContract({
       .object({
         fresh: z.boolean(),
         message: z.string().trim().min(1).max(200).optional(),
+        /** Publish although the check found blocked terms (the user reviewed them). */
+        allowFlagged: z.boolean().optional(),
       })
       .strict(),
     output: pushResultSchema,
+  },
+  sync_publish_check: {
+    input: z.null(),
+    output: z.object({ hits: z.array(publishHitSchema), terms: z.array(z.string()) }).strict(),
+  },
+  sync_skills_overview: {
+    input: z.null(),
+    output: skillsOverviewSchema,
+  },
+  sync_conflict_detail: {
+    input: z.object({ conflictId: z.string().min(1).max(400) }).strict(),
+    output: conflictDetailSchema,
+  },
+  sync_save_skill_groups: {
+    input: z.object({ groups: skillGroupsSchema }).strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
+  },
+  sync_set_skill_rule: {
+    input: z
+      .object({
+        collectionId: z.string().min(1).max(80),
+        skill: z.string().min(1).max(200),
+        rule: skillRuleSchema.nullable(),
+      })
+      .strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
   },
   sync_pull: {
     input: z
@@ -91,7 +122,8 @@ const usage = [
   "  bb preset status [--json]",
   "  bb preset diff [--json]",
   "  bb preset capture [--json]",
-  "  bb preset push [--fresh] [--message <text>] [--json]",
+  "  bb preset push [--fresh] [--message <text>] [--allow-flagged] [--json]",
+  "  bb preset skills [--json]",
   "  bb preset pull --yes [--plan <fingerprint>] [--only <id,id>] [--json]",
   "  bb preset restore --yes [--json]",
   "",
@@ -99,6 +131,8 @@ const usage = [
   "Machine settings (provider order, server URL, paths) stay on each machine.",
   "A file or setting changed here and in the preset is kept and shown as a conflict.",
   "Every pull backs up what it replaces; restore undoes the most recent pull.",
+  "Skill groups skipped on this machine are neither pulled nor published from here.",
+  "A publish containing a blocked term stops until you pass --allow-flagged.",
   "Secret settings, credentials, sessions, and runtime data are never captured.",
 ].join("\n");
 
@@ -120,6 +154,17 @@ function planText(plan: SyncPlan): string {
     );
     for (const conflict of plan.conflicts) {
       lines.push(`  ~ ${conflict.target}: ${conflict.detail}`);
+      if (conflict.skill !== undefined) {
+        const newer =
+          conflict.skill.newer === "remote"
+            ? "preset is newer"
+            : conflict.skill.newer === "local"
+              ? "yours is newer"
+              : conflict.skill.newer === "same"
+                ? "same release"
+                : "unknown which is newer";
+        lines.push(`      ${newer}${conflict.skill.hint ? " (hint)" : ""}: ${conflict.skill.reason}  [${conflict.id}]`);
+      }
     }
   }
   for (const warning of plan.warnings) lines.push(`  ! ${warning}`);
@@ -318,6 +363,13 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Comma-separated pluginId.settingKey pairs.",
       default: "",
     },
+    publishBlockTerms: {
+      type: "string",
+      label: "Never publish these terms",
+      description:
+        "Comma-separated terms such as a company domain or a work e-mail address. A publish that would contain one stops and shows where it was found.",
+      default: "",
+    },
     syncedPluginSettingKeys: {
       type: "string",
       label: "Also sync these plugin paths or commands",
@@ -357,6 +409,7 @@ export default async function plugin(bb: BbPluginApi) {
       excludedPluginSettingKeys: value.excludedPluginSettingKeys ?? "",
       syncedSettingKeys: value.syncedSettingKeys ?? "",
       syncedPluginSettingKeys: value.syncedPluginSettingKeys ?? "",
+      publishBlockTerms: value.publishBlockTerms ?? "",
     };
   });
 
@@ -367,7 +420,18 @@ export default async function plugin(bb: BbPluginApi) {
     sync_cached_check: () => service.cachedCheck(),
     sync_preview: () => service.preview(),
     sync_capture: () => service.capture(),
-    sync_push: ({ fresh, message }) => service.push({ fresh, message }),
+    sync_push: ({ fresh, message, allowFlagged }) => service.push({ fresh, message, allowFlagged }),
+    sync_publish_check: () => service.publishCheck(),
+    sync_skills_overview: () => service.skillsOverview(),
+    sync_conflict_detail: ({ conflictId }) => service.conflictDetail(conflictId),
+    sync_save_skill_groups: async ({ groups }) => {
+      await service.saveGroups(groups);
+      return { ok: true as const };
+    },
+    sync_set_skill_rule: async ({ collectionId, skill, rule }) => {
+      await service.setSkillRule(collectionId, skill, rule);
+      return { ok: true as const };
+    },
     sync_pull: ({ fingerprint, selectedChangeIds, resolutions }) =>
       service.pullAndApply({
         expectedFingerprint: fingerprint,
@@ -419,6 +483,11 @@ export default async function plugin(bb: BbPluginApi) {
         name: "restore",
         summary: "Undo the most recent pull",
         usage: "bb preset restore --yes [--json]",
+      },
+      {
+        name: "skills",
+        summary: "Show synced skills per folder: here, in the preset, skipped",
+        usage: "bb preset skills [--json]",
       },
     ],
     async run(argv, context) {
@@ -477,6 +546,7 @@ export default async function plugin(bb: BbPluginApi) {
               "--fresh",
               "--json",
               "--message",
+              "--allow-flagged",
               parsedMessage.value,
             ]);
             if (argv.some((argument) => !known.has(argument))) {
@@ -486,6 +556,7 @@ export default async function plugin(bb: BbPluginApi) {
               fresh: argv.includes("--fresh"),
               message: parsedMessage.value,
               signal: context.signal,
+              allowFlagged: argv.includes("--allow-flagged"),
             });
             const text = pushed.pushed
               ? `Pushed ${pushed.changedFiles.length} preset files at ${pushed.head.slice(0, 12)}.`
@@ -544,10 +615,30 @@ export default async function plugin(bb: BbPluginApi) {
             ].join("\n");
             return respond(result, text, result.errors.length === 0 ? 0 : 1);
           }
+          case "skills": {
+            const overview = await service.skillsOverview(context.signal);
+            const lines = overview.folders.flatMap((folder) => [
+              `${folder.target}: ${folder.counts.here} here, ${folder.counts.afterPull} after pull, ${folder.counts.inPreset} in the preset, ${folder.counts.skipped} skipped (~${folder.tokensAfterPull} startup tokens)`,
+              ...folder.skills
+                .filter((row) => row.status !== "same")
+                .map((row) => `  ${row.status.padEnd(9)} ${row.name}${row.group === undefined ? "" : `  [${row.group}]`}`),
+            ]);
+            return respond(overview, lines.join("\n"));
+          }
           default:
             return { exitCode: 2, stderr: usage };
         }
       } catch (cause) {
+        if (cause instanceof PublishBlockedError) {
+          return {
+            exitCode: 3,
+            stderr: [
+              `Preset Sync: ${cause.message}`,
+              ...cause.hits.map((hit) => `  ! ${hit.where}: ${hit.term}`),
+              'Exclude them, or rerun with "--allow-flagged" after checking.',
+            ].join("\n"),
+          };
+        }
         return {
           exitCode: 1,
           stderr: `Preset Sync: ${errorMessage(cause)}`,

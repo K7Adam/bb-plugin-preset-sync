@@ -7,9 +7,12 @@ import { promisify } from "node:util";
 import {
   MANAGED_PRESET_FILES,
   errorMessage,
+  readPresetExtras,
   readPresetSnapshot,
+  sameJson,
   samePresetConfiguration,
   writePresetSnapshot,
+  type PresetExtras,
   type PresetSnapshot,
 } from "./preset";
 import {
@@ -196,15 +199,17 @@ export async function readRemotePreset(
   head: string;
   vendored: VendoredManifest;
   vendoredWarning?: string;
+  extras: PresetExtras;
 }> {
   return withClone(options, async (repoDir) => {
-    const [snapshot, head, vendored] = await Promise.all([
+    const [snapshot, head, vendored, extras] = await Promise.all([
       readPresetSnapshot(repoDir),
       runGit(["rev-parse", "HEAD"], { ...options, cwd: repoDir }),
       readVendoredManifest(repoDir).catch((cause) => ({
         warning: `vendored.json could not be read (${errorMessage(cause)}); vendored payloads will be skipped.`,
         manifest: null,
       })),
+      readPresetExtras(repoDir),
     ]);
     const vendoredWarning =
       vendored !== null && "warning" in vendored
@@ -235,13 +240,14 @@ export async function readRemotePreset(
       // A missing vendored/ directory is tolerated; materialization verifies
       // each manifest entry against real files and reports gaps.
     }
-    return { snapshot, head, vendored: vendoredManifest, vendoredWarning };
+    return { snapshot, head, vendored: vendoredManifest, vendoredWarning, extras };
   });
 }
 
 export async function pushRemotePreset(
   options: GitPushOptions,
   snapshot: PresetSnapshot,
+  extras: PresetExtras,
   vendored?: {
     manifest: VendoredManifest;
     sourceDirs: Map<string, string>;
@@ -268,10 +274,11 @@ export async function pushRemotePreset(
   }
 
   return withClone(options, async (repoDir) => {
-    const [existing, existingHead, existingVendored] = await Promise.all([
+    const [existing, existingHead, existingVendored, existingExtras] = await Promise.all([
       readExistingPreset(repoDir),
       runGit(["rev-parse", "HEAD"], { ...options, cwd: repoDir }),
       readVendoredManifest(repoDir).catch(() => null),
+      readPresetExtras(repoDir),
     ]);
     const vendoredManifest = vendored?.manifest ?? {
       schemaVersion: 1 as const,
@@ -282,12 +289,13 @@ export async function pushRemotePreset(
       samePresetConfiguration(existing, snapshot) &&
       vendored !== undefined &&
       existingVendored !== null &&
-      sameVendoredManifest(existingVendored, vendoredManifest)
+      sameVendoredManifest(existingVendored, vendoredManifest) &&
+      sameJson(existingExtras.provenance, extras.provenance)
     ) {
       return { pushed: false, head: existingHead, changedFiles: [], vendoredErrors: [] };
     }
 
-    await writePresetSnapshot(repoDir, snapshot);
+    await writePresetSnapshot(repoDir, snapshot, extras);
     await writeVendoredManifest(repoDir, vendoredManifest);
     const vendoredErrors: string[] = [];
     if (vendored !== undefined) {

@@ -58,8 +58,11 @@ export interface PullInputs {
   selection?: ReadonlySet<string>;
   /** Conflict id -> choice. Unresolved conflicts keep the local value. */
   resolutions: Readonly<Record<string, ConflictChoice>>;
-  /** Choice for file conflicts nobody resolved explicitly. */
-  defaultFileConflict?: ConflictChoice;
+  /**
+   * Choice for a conflicted file of a synced folder: the user's decision for
+   * its skill, a remembered rule, or the conflict mode. Undefined keeps it.
+   */
+  fileConflictChoice: (collectionId: string, path: string) => ConflictChoice | undefined;
   npmInstall: boolean;
   journal: PullJournal;
   runProcess: RunProcess;
@@ -107,7 +110,7 @@ export async function applyPull(inputs: PullInputs): Promise<PullOutcome> {
   const choice = (conflictId: string): ConflictChoice | undefined => inputs.resolutions[conflictId];
 
   await applyMarketplaces(inputs, out, selected);
-  await applyFolders(inputs, out, selected, choice, folderState);
+  await applyFolders(inputs, out, selected, folderState);
   await applyVendoredPlugins(inputs, out, selected, folderState);
   await installPortablePlugins(inputs, out, selected);
 
@@ -156,13 +159,11 @@ async function applyFolders(
   inputs: PullInputs,
   out: Outcome,
   selected: (id: string) => boolean,
-  choice: (conflictId: string) => ConflictChoice | undefined,
   folderState: VendorAppliedState["collections"],
 ) {
   for (const plan of inputs.folders) {
     const id = plan.collection.id;
-    const resolveConflict = (path: string) =>
-      choice(`conflict:files:${id}:${path}`) ?? inputs.defaultFileConflict;
+    const resolveConflict = (path: string) => inputs.fileConflictChoice(id, path);
     const folderSelected = selected(`files:${id}`);
     const resolvedConflicts = plan.decisions.filter(
       (decision) => decision.action === "conflict" && resolveConflict(decision.path) !== undefined,

@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { decideMerge } from "./merge";
 import { backupLabel, type PullJournal } from "./journal";
+import { skillOf } from "./skills";
 import {
   isValidVendoredRelPath,
   matchesGlob,
@@ -132,7 +133,33 @@ export async function planFolder(args: {
             : "conflict",
     );
   }
+  // A skill is one unit: when any of its files conflicts, the whole skill
+  // waits for one decision so it never ends up half old, half new.
+  const conflictedSkillNames = new Set(
+    plan.decisions.filter((entry) => entry.action === "conflict").map((entry) => skillOf(entry.path)),
+  );
+  for (const entry of plan.decisions) {
+    if (
+      (entry.action === "add" || entry.action === "update") &&
+      conflictedSkillNames.has(skillOf(entry.path))
+    ) {
+      entry.action = "conflict";
+    }
+  }
   return plan;
+}
+
+/** Conflicted skills of a folder plan with the files that differ. */
+export function conflictedSkills(plan: FolderPlan): { skill: string; paths: string[] }[] {
+  const bySkill = new Map<string, string[]>();
+  for (const entry of plan.decisions) {
+    if (entry.action !== "conflict") continue;
+    const skill = skillOf(entry.path);
+    bySkill.set(skill, [...(bySkill.get(skill) ?? []), entry.path]);
+  }
+  return [...bySkill]
+    .map(([skill, paths]) => ({ skill, paths }))
+    .sort((left, right) => left.skill.localeCompare(right.skill));
 }
 
 export interface FolderApplyResult {

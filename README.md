@@ -142,15 +142,53 @@ a linked folder inside a synced folder is skipped, and a synced folder that is
 itself a link is skipped as a whole. `~/.claude/skills/synced` belongs to the
 Claude app and is always left alone.
 
+## Skills
+
+A synced folder of agent skills is handled skill by skill (a skill is a folder
+with a `SKILL.md`, see [agentskills.io](https://agentskills.io/specification)).
+
+**Skill groups.** The Skills panel on the Preset Sync page shows, per folder,
+how many skills are here now, after the pull and in the preset, with an
+estimate of the startup tokens agents spend on their names and descriptions.
+Named groups such as "Android" (`android-*, compose-*`) can be skipped on this
+machine: a skipped group is neither pulled here nor published from here, and
+stays in the preset for other machines. Groups are stored per machine.
+
+**Conflicts.** When a skill changed here and in the preset since the last
+sync, the whole skill waits for one decision. The page shows which side is
+newer and why, in this order of evidence:
+
+1. `metadata.version` (or a top-level `version`) of both `SKILL.md` files;
+2. the skills installer's record (`~/.agents/.skill-lock.json`): the same
+   source with a different folder hash, the later `updatedAt` wins. Each
+   machine publishes these records in `preset/skill-provenance.json`;
+3. only as a marked hint: whether your copy changed after the preset was
+   published.
+
+"Show differences" opens the files in BB's diff viewer (− only in your copy,
++ only in the other machine's). Choose Keep mine or Use the other version, take
+the newer version for every skill with clear evidence at once, or remember a
+rule for a skill: always mine, always the preset, or always the newer one (a
+date-only hint never decides on its own).
+
+## Never publish these terms
+
+List terms such as a company domain or a work e-mail address under **Never
+publish these terms**. Before every publish, Preset Sync searches plugin
+entries, settings and the files of synced folders this machine contributes. If
+it finds one, nothing is pushed and the page lists every place; "Publish
+anyway" (or `--allow-flagged`) continues after checking.
+
 ## Commands
 
 ```text
 bb preset status
 bb preset diff
 bb preset capture
-bb preset push [--fresh] [--message <text>]
+bb preset push [--fresh] [--message <text>] [--allow-flagged]
 bb preset pull --yes [--plan <fingerprint>] [--only <id,id>]
 bb preset restore --yes
+bb preset skills
 ```
 
 ## Captured data

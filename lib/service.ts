@@ -1,10 +1,11 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { lstat, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { countFolder, planFolder, type FolderPlan } from "./folder-sync";
+import { unifiedDiff } from "./diff";
+import { conflictedSkills, countFolder, planFolder, type FolderPlan } from "./folder-sync";
 import { pushRemotePreset, readRemotePreset } from "./git";
 import { PullJournal } from "./journal";
 import { EMPTY_SYNC_BASE, syncBaseSchema, type SyncBase } from "./merge";
@@ -33,6 +34,8 @@ import {
   type PluginSettingPresetEntry,
   type PresetSnapshot,
   type RestoreResult,
+  type SkillConflictInfo,
+  type SkillRule,
   type SyncPlan,
   type SyncScope,
 } from "./preset";
@@ -43,7 +46,24 @@ import {
   type InstalledPlugin,
 } from "./plugins-api";
 import { applyPull, type ConflictChoice } from "./pull";
+import { PublishBlockedError, parseBlockTerms, scanPublish, type PublishHit } from "./publish-guard";
 import { restoreLastPull } from "./restore";
+import {
+  buildFolderOverview,
+  groupExcludes,
+  skillGroupsSchema,
+  type ConflictDetail,
+  type SkillGroup,
+  type SkillsOverview,
+} from "./skill-groups";
+import {
+  decideNewer,
+  parseSkillHeader,
+  readLocalSkillLock,
+  skillOf,
+  type SkillHeader,
+  type SkillProvenanceFile,
+} from "./skills";
 import {
   VendorError,
   collectionIdForPath,
@@ -100,6 +120,8 @@ export interface SyncSettings {
   syncedSettingKeys?: string;
   /** Default-local `pluginId.key` pairs this machine syncs anyway. */
   syncedPluginSettingKeys?: string;
+  /** Comma-separated terms that block a publish (company domain, work e-mail). */
+  publishBlockTerms?: string;
 }
 
 export interface PullOptions {
@@ -168,12 +190,20 @@ interface Gathered {
   base: SyncBase;
   folders: FolderPlan[];
   plan: SyncPlan;
+  groups: SkillGroup[];
+  /** collectionId -> skill -> version evidence of a conflicted skill. */
+  skillInfos: Map<string, Map<string, SkillConflictInfo>>;
+  /** Exclude patterns of this machine (settings plus skipped skill groups). */
+  excludes: string[];
+  payloadRoot: string;
 }
 
 const STAGED_KEY = "staged-preset-v1";
 const LAST_OPERATION_KEY = "last-operation-v1";
 const CACHED_CHECK_KEY = "cached-check-v1";
 const SYNC_BASE_KEY = "sync-base-v1";
+const SKILL_GROUPS_KEY = "skill-groups-v1";
+const SKILL_RULES_KEY = "skill-rules-v1";
 const MAX_STAGED_BYTES = 240 * 1024;
 const DEFAULT_BACKGROUND_INTERVAL_MS = 5 * 60 * 1_000;
 const ALLOWED_BACKGROUND_INTERVALS = new Set([1, 5, 10, 15, 30, 60]);
@@ -310,6 +340,27 @@ function cachedCheckFingerprint(check: CachedSyncCheck | null): unknown {
   };
 }
 
+function payloadDirFor(payloadRoot: string, collection: VendoredCollection): string {
+  return join(payloadRoot, ...collection.repoDir.replace(/^vendored\//, "").split("/"));
+}
+
+async function readSkillHeaderAt(path: string): Promise<SkillHeader> {
+  try {
+    return parseSkillHeader(await readFile(path, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+async function latestModification(root: string, paths: readonly string[]): Promise<string | undefined> {
+  let latest: number | undefined;
+  for (const path of paths) {
+    const entry = await stat(join(root, ...path.split("/"))).catch(() => null);
+    if (entry !== null && (latest === undefined || entry.mtimeMs > latest)) latest = entry.mtimeMs;
+  }
+  return latest === undefined ? undefined : new Date(latest).toISOString();
+}
+
 function folderBaseFiles(collection: VendoredCollection): Record<string, string> {
   return Object.fromEntries(collection.entries.map((entry) => [entry.path, entry.sha256]));
 }
@@ -370,6 +421,35 @@ export class PresetSyncService {
 
   private async writeBase(base: SyncBase): Promise<void> {
     await this.bb.storage.kv.set(SYNC_BASE_KEY, base);
+  }
+
+  async readGroups(): Promise<SkillGroup[]> {
+    const parsed = skillGroupsSchema.safeParse(await this.bb.storage.kv.get<unknown>(SKILL_GROUPS_KEY));
+    return parsed.success ? parsed.data : [];
+  }
+
+  async saveGroups(groups: SkillGroup[]): Promise<void> {
+    await this.bb.storage.kv.set(SKILL_GROUPS_KEY, skillGroupsSchema.parse(groups));
+    this.wakeBackgroundCheck();
+  }
+
+  private async readRules(): Promise<Record<string, SkillRule>> {
+    const value = await this.bb.storage.kv.get<Record<string, SkillRule>>(SKILL_RULES_KEY);
+    return value !== undefined && value !== null && typeof value === "object" ? value : {};
+  }
+
+  /** Remember (or forget with null) what happens to one skill on conflicts. */
+  async setSkillRule(collectionId: string, skill: string, rule: SkillRule | null): Promise<void> {
+    const rules = { ...(await this.readRules()) };
+    const key = `${collectionId}:${skill}`;
+    if (rule === null) delete rules[key];
+    else rules[key] = rule;
+    await this.bb.storage.kv.set(SKILL_RULES_KEY, rules);
+  }
+
+  /** Exclude patterns of this machine: the setting plus every skipped skill group. */
+  private async folderExcludes(settings: SyncSettings): Promise<string[]> {
+    return [...parseGlobList(settings.vendorExcludeGlobs), ...groupExcludes(await this.readGroups())];
   }
 
   async cachedCheck(): Promise<CachedSyncCheck | null> {
@@ -586,7 +666,7 @@ export class PresetSyncService {
     const limits = {
       maxFileBytes: Math.max(1, settings.vendorMaxFileKb) * 1024,
       maxBytes: Math.max(1, settings.vendorMaxCollectionMb) * 1024 * 1024,
-      excludeGlobs: parseGlobList(settings.vendorExcludeGlobs),
+      excludeGlobs: await this.folderExcludes(settings),
     };
     const collected = {
       plugins: [] as { id: string; install: string; enabled: boolean }[],
@@ -651,20 +731,24 @@ export class PresetSyncService {
   }
 
   /** Read the preset once, compare it with this machine and build the plan. */
-  private async gather(signal?: AbortSignal, copyVendoredTo?: string): Promise<Gathered> {
+  private async gather(signal: AbortSignal | undefined, payloadRoot: string): Promise<Gathered> {
     const settings = await this.remoteSettings();
     const scope = scopeFromSettings(settings);
-    const [remote, local, applied, base] = await Promise.all([
+    const [remote, local, applied, base, groups, rules, localLock, excludes] = await Promise.all([
       readRemotePreset({
         repositoryUrl: settings.repositoryUrl,
         branch: settings.branch,
         githubToken: settings.githubToken,
-        copyVendoredTo,
+        copyVendoredTo: payloadRoot,
         signal,
       }),
       this.captureSnapshot(signal),
       readVendorState(),
       this.readBase(),
+      this.readGroups(),
+      this.readRules(),
+      readLocalSkillLock(),
+      this.folderExcludes(settings),
     ]);
     const remoteScoped: RemotePreset = {
       ...remote,
@@ -680,7 +764,6 @@ export class PresetSyncService {
       ...syncScopeWarnings(scope, remote.snapshot, local.snapshot),
     ];
 
-    const localExcludes = parseGlobList(settings.vendorExcludeGlobs);
     const folders: FolderPlan[] = [];
     for (const collection of remoteScoped.vendored.collections) {
       if (collection.kind !== "files") continue;
@@ -694,10 +777,44 @@ export class PresetSyncService {
           collection,
           target: collection.target!,
           targetDir,
-          excludeGlobs: [...localExcludes, ...appManagedExcludes(collection.target)],
+          excludeGlobs: [...excludes, ...appManagedExcludes(collection.target)],
           baseFiles: applied.collections[collection.id]?.files,
         }),
       );
+    }
+
+    const remoteMachine = remote.extras.machine;
+    const skillInfos = new Map<string, Map<string, SkillConflictInfo>>();
+    for (const folder of folders) {
+      const infos = new Map<string, SkillConflictInfo>();
+      const remoteDir = payloadDirFor(payloadRoot, folder.collection);
+      for (const { skill, paths } of conflictedSkills(folder)) {
+        const [localHeader, remoteHeader, localModifiedAt] = await Promise.all([
+          readSkillHeaderAt(join(folder.targetDir, skill, "SKILL.md")),
+          readSkillHeaderAt(join(remoteDir, skill, "SKILL.md")),
+          latestModification(folder.targetDir, paths),
+        ]);
+        const verdict = decideNewer({
+          localVersion: localHeader.version,
+          remoteVersion: remoteHeader.version,
+          localSource: localLock[skill],
+          remoteSource: remote.extras.provenance.skills[skill],
+          localModifiedAt,
+          remotePublishedAt: remote.snapshot.capturedAt === "unknown" ? undefined : remote.snapshot.capturedAt,
+          remoteMachine,
+        });
+        const rule = rules[`${folder.collection.id}:${skill}`];
+        infos.set(skill, {
+          collectionId: folder.collection.id,
+          skill,
+          paths,
+          ...(localHeader.version === undefined ? {} : { localVersion: localHeader.version }),
+          ...(remoteHeader.version === undefined ? {} : { remoteVersion: remoteHeader.version }),
+          ...verdict,
+          ...(rule === undefined ? {} : { rule }),
+        });
+      }
+      skillInfos.set(folder.collection.id, infos);
     }
 
     const plan = buildPullPlan({
@@ -718,16 +835,41 @@ export class PresetSyncService {
           add: counts.add,
           update: counts.update,
           skipped: counts.skip,
-          conflictPaths: folder.decisions
-            .filter((decision) => decision.action === "conflict")
-            .map((decision) => decision.path),
+          conflictSkills: [...(skillInfos.get(folder.collection.id)?.values() ?? [])],
           blocked: folder.blocked,
         };
       }),
       localPluginSettingKeys: local.pluginSettingKeys,
       installedPluginIds: local.installedPluginIds,
+      remoteMachine,
     });
-    return { settings, scope, remote, remoteScoped, local, applied, base, folders, plan };
+    return {
+      settings,
+      scope,
+      remote,
+      remoteScoped,
+      local,
+      applied,
+      base,
+      folders,
+      plan,
+      groups,
+      skillInfos,
+      excludes,
+      payloadRoot,
+    };
+  }
+
+  /** Run with a temporary copy of the preset's folder payloads. */
+  private async withPayload<T>(run: (payloadRoot: string) => Promise<T>): Promise<T> {
+    const payloadRoot = await mkdtemp(join(tmpdir(), "bb-preset-read-"));
+    try {
+      return await run(payloadRoot);
+    } finally {
+      await rm(payloadRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }).catch(
+        () => undefined,
+      );
+    }
   }
 
   /** Folder collections as a push would publish them (see mergeFolderForPush). */
@@ -739,7 +881,7 @@ export class PresetSyncService {
     settings: SyncSettings;
   }): Promise<{ collections: VendoredCollection[]; preserved: Map<string, Set<string>> }> {
     const remoteById = new Map((args.remote?.collections ?? []).map((entry) => [entry.id, entry]));
-    const localExcludes = parseGlobList(args.settings.vendorExcludeGlobs);
+    const localExcludes = await this.folderExcludes(args.settings);
     const preserved = new Map<string, Set<string>>();
     const collections: VendoredCollection[] = [];
     for (const collection of args.local) {
@@ -762,12 +904,14 @@ export class PresetSyncService {
   }
 
   async preview(signal?: AbortSignal): Promise<SyncPlan> {
-    return this.exclusive(async () => (await this.gather(signal)).plan);
+    return this.exclusive(() =>
+      this.withPayload(async (payloadRoot) => (await this.gather(signal, payloadRoot)).plan),
+    );
   }
 
   async status(signal?: AbortSignal) {
-    return this.exclusive(async () => {
-      const { remote, local, scope, settings, plan, applied, base } = await this.gather(signal);
+    return this.exclusive(() => this.withPayload(async (payloadRoot) => {
+      const { remote, local, scope, settings, plan, applied, base } = await this.gather(signal, payloadRoot);
       const [staged, lastOperation] = await Promise.all([
         this.readStaged(),
         this.readLastOperation(),
@@ -809,12 +953,13 @@ export class PresetSyncService {
         pullChanges: plan.changes,
         pushChanges,
         conflicts: plan.conflicts,
+        ...(plan.remoteMachine === undefined ? {} : { remoteMachine: plan.remoteMachine }),
         warnings: plan.warnings,
         lastOperation,
       };
       await this.writeCachedCheck({ checkedAt, status, error: null });
       return status;
-    });
+    }));
   }
 
   async checkInBackground(signal?: AbortSignal): Promise<void> {
@@ -950,7 +1095,7 @@ export class PresetSyncService {
     const warnings: string[] = [];
     const collections: VendoredCollection[] = [];
     const sourceDirs = new Map<string, string>();
-    const excludeGlobs = parseGlobList(settings.vendorExcludeGlobs);
+    const excludeGlobs = await this.folderExcludes(settings);
     const maxFileBytes = Math.max(1, settings.vendorMaxFileKb) * 1024;
     const maxBytes = Math.max(1, settings.vendorMaxCollectionMb) * 1024 * 1024;
 
@@ -1053,7 +1198,7 @@ export class PresetSyncService {
     }
   }
 
-  async push(args: { fresh: boolean; message?: string; signal?: AbortSignal }) {
+  async push(args: { fresh: boolean; message?: string; signal?: AbortSignal; allowFlagged?: boolean }) {
     return this.exclusive(async () => {
       const settings = await this.remoteSettings();
       let staged = await this.readStaged();
@@ -1066,6 +1211,7 @@ export class PresetSyncService {
       const scope = scopeFromSettings(settings);
       let remoteSnapshot: PresetSnapshot | null = null;
       let remoteVendored: VendoredManifest | null = null;
+      let remoteProvenance: SkillProvenanceFile | null = null;
       try {
         const remote = await readRemotePreset({
           repositoryUrl: settings.repositoryUrl,
@@ -1075,6 +1221,7 @@ export class PresetSyncService {
         });
         remoteSnapshot = remote.snapshot;
         remoteVendored = remote.vendored;
+        remoteProvenance = remote.extras.provenance;
       } catch {
         remoteSnapshot = null;
         remoteVendored = null;
@@ -1105,6 +1252,14 @@ export class PresetSyncService {
         mergedPlugins: mergedSnapshot.plugins,
         scope,
       });
+      const hits = await scanPublish({
+        snapshot: staged.snapshot,
+        collections: rebuilt.collections,
+        sourceDirs: rebuilt.sourceDirs,
+        terms: parseBlockTerms(settings.publishBlockTerms),
+      });
+      if (hits.length > 0 && args.allowFlagged !== true) throw new PublishBlockedError(hits);
+      const provenance = await this.publishedProvenance(rebuilt.collections, remoteProvenance);
       const pushed = await pushRemotePreset(
         {
           repositoryUrl: settings.repositoryUrl,
@@ -1116,6 +1271,7 @@ export class PresetSyncService {
           signal: args.signal,
         },
         mergedSnapshot,
+        { machine: hostname(), provenance },
         {
           manifest: { schemaVersion: 1, collections: mergedVendored },
           sourceDirs: rebuilt.sourceDirs,
@@ -1217,7 +1373,8 @@ export class PresetSyncService {
               ? undefined
               : new Set(options.selectedChangeIds),
           resolutions: options.resolutions ?? {},
-          defaultFileConflict: settings.vendorConflictMode === "skip" ? undefined : "take-remote",
+          fileConflictChoice: (collectionId, path) =>
+            this.fileConflictChoice(gathered, options.resolutions ?? {}, collectionId, path),
           npmInstall: settings.vendorNpmInstall,
           journal,
           runProcess: (command, args, cwd) => this.runProcess(command, args, cwd),
@@ -1269,6 +1426,148 @@ export class PresetSyncService {
         }).catch(() => undefined);
       }
     });
+  }
+
+  /**
+   * Decide one conflicted file of a synced folder: the user's choice for its
+   * skill (or, from older clients, for the file), then a remembered rule for
+   * the skill, then the conflict mode. Undefined keeps the local version.
+   */
+  private fileConflictChoice(
+    gathered: Gathered,
+    resolutions: Readonly<Record<string, ConflictChoice>>,
+    collectionId: string,
+    path: string,
+  ): ConflictChoice | undefined {
+    const skill = skillOf(path);
+    const explicit =
+      resolutions[`conflict:skill:${collectionId}:${skill}`] ??
+      resolutions[`conflict:files:${collectionId}:${path}`];
+    if (explicit !== undefined) return explicit;
+    const info = gathered.skillInfos.get(collectionId)?.get(skill);
+    if (info?.rule === "keep-local" || info?.rule === "take-remote") return info.rule;
+    if (info?.rule === "newer" && !info.hint) {
+      if (info.newer === "remote") return "take-remote";
+      if (info.newer === "local" || info.newer === "same") return "keep-local";
+    }
+    return gathered.settings.vendorConflictMode === "skip" ? undefined : "take-remote";
+  }
+
+  /**
+   * Install records of the skills this machine publishes win; skills it does
+   * not publish keep the record of the machine that did.
+   */
+  private async publishedProvenance(
+    collections: readonly VendoredCollection[],
+    remote: SkillProvenanceFile | null,
+  ): Promise<SkillProvenanceFile> {
+    const localLock = await readLocalSkillLock();
+    const published = new Set(
+      collections
+        .filter((collection) => collection.kind === "files")
+        .flatMap((collection) => collection.entries.map((entry) => skillOf(entry.path))),
+    );
+    const skills = { ...(remote?.skills ?? {}) };
+    for (const [name, record] of Object.entries(localLock)) {
+      if (published.has(name)) skills[name] = record;
+    }
+    return { schemaVersion: 1, skills };
+  }
+
+  /** What a publish would send that contains a blocked term; nothing is pushed. */
+  async publishCheck(signal?: AbortSignal): Promise<{ hits: PublishHit[]; terms: string[] }> {
+    return this.exclusive(async () => {
+      const settings = await this.remoteSettings();
+      const terms = parseBlockTerms(settings.publishBlockTerms);
+      const captured = await this.captureSnapshot(signal);
+      const hits = await scanPublish({
+        snapshot: captured.snapshot,
+        collections: applyVendoredScope(captured.vendored, scopeFromSettings(settings)),
+        sourceDirs: captured.vendoredSourceDirs,
+        terms,
+      });
+      return { hits, terms };
+    });
+  }
+
+  /** Every synced folder skill by skill: here, in the preset, skipped, conflicts. */
+  async skillsOverview(signal?: AbortSignal): Promise<SkillsOverview> {
+    return this.exclusive(() =>
+      this.withPayload(async (payloadRoot) => {
+        const gathered = await this.gather(signal, payloadRoot);
+        const folders = [];
+        for (const plan of gathered.folders) {
+          const entries = await readdir(plan.targetDir, { withFileTypes: true }).catch(() => []);
+          const localEntries: { name: string; linked: boolean }[] = [];
+          const localHeaders = new Map<string, SkillHeader>();
+          for (const entry of entries) {
+            const linked =
+              (await lstat(join(plan.targetDir, entry.name)).catch(() => null))?.isSymbolicLink() ?? false;
+            if (!entry.isDirectory() && !linked) continue;
+            localEntries.push({ name: entry.name, linked });
+            localHeaders.set(entry.name, await readSkillHeaderAt(join(plan.targetDir, entry.name, "SKILL.md")));
+          }
+          const remoteHeaders = new Map<string, SkillHeader>();
+          const remoteDir = payloadDirFor(payloadRoot, plan.collection);
+          for (const skill of new Set(plan.collection.entries.map((entry) => skillOf(entry.path)))) {
+            remoteHeaders.set(skill, await readSkillHeaderAt(join(remoteDir, skill, "SKILL.md")));
+          }
+          folders.push(
+            buildFolderOverview({
+              plan,
+              localEntries,
+              localHeaders,
+              remoteHeaders,
+              excludeGlobs: [...gathered.excludes, ...appManagedExcludes(plan.target)],
+              groups: gathered.groups,
+            }),
+          );
+        }
+        return {
+          ...(gathered.plan.remoteMachine === undefined ? {} : { remoteMachine: gathered.plan.remoteMachine }),
+          folders,
+          groups: gathered.groups,
+        };
+      }),
+    );
+  }
+
+  /** Both versions of a conflicted skill, file by file, as unified patches. */
+  async conflictDetail(conflictId: string, signal?: AbortSignal): Promise<ConflictDetail> {
+    const match = /^conflict:skill:([^:]+):(.+)$/.exec(conflictId);
+    if (match === null) throw new Error(`Not a skill conflict: ${conflictId}`);
+    const collectionId = match[1]!;
+    const skill = match[2]!;
+    return this.exclusive(() =>
+      this.withPayload(async (payloadRoot) => {
+        const gathered = await this.gather(signal, payloadRoot);
+        const plan = gathered.folders.find((folder) => folder.collection.id === collectionId);
+        const info = gathered.skillInfos.get(collectionId)?.get(skill);
+        if (plan === undefined || info === undefined) {
+          throw new Error("This conflict no longer exists. Review the updates again.");
+        }
+        const remoteDir = payloadDirFor(payloadRoot, plan.collection);
+        const files = [];
+        for (const path of info.paths) {
+          const [local, remote] = await Promise.all([
+            readFile(join(plan.targetDir, ...path.split("/"))).catch(() => null),
+            readFile(join(remoteDir, ...path.split("/"))).catch(() => null),
+          ]);
+          const diff = await unifiedDiff(`${plan.target.replace(/^~\//, "")}/${path}`, local, remote);
+          files.push({
+            path,
+            change: local === null ? ("new-in-preset" as const) : ("differs" as const),
+            ...diff,
+          });
+        }
+        return {
+          conflictId,
+          ...(gathered.plan.remoteMachine === undefined ? {} : { remoteMachine: gathered.plan.remoteMachine }),
+          skill: info,
+          files,
+        };
+      }),
+    );
   }
 
   /** Undo the most recent pull (files, settings); see lib/restore.ts. */

@@ -3,6 +3,7 @@ import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { z } from "zod";
 import { baseEntry, decideMerge, type MergeDecision, type SyncBase } from "./merge";
+import { EMPTY_PROVENANCE, skillProvenanceFileSchema, type SkillProvenanceFile } from "./skills";
 import {
   GENERAL_SETTING_LABELS,
   isExperimentSynced,
@@ -172,6 +173,27 @@ export const planChangeSchema = z
   })
   .strict();
 
+export const skillRuleSchema = z.enum(["keep-local", "take-remote", "newer"]);
+export type SkillRule = z.infer<typeof skillRuleSchema>;
+
+/** Version evidence for one conflicted skill (see lib/skills.ts decideNewer). */
+export const skillConflictInfoSchema = z
+  .object({
+    collectionId: z.string(),
+    skill: z.string(),
+    paths: z.array(z.string()),
+    localVersion: z.string().optional(),
+    remoteVersion: z.string().optional(),
+    newer: z.enum(["local", "remote", "same", "unknown"]),
+    evidence: z.enum(["version", "source", "date", "none"]),
+    hint: z.boolean(),
+    reason: z.string(),
+    rule: skillRuleSchema.optional(),
+  })
+  .strict();
+
+export type SkillConflictInfo = z.infer<typeof skillConflictInfoSchema>;
+
 /** Something changed both here and in the preset since the last sync. */
 export const planConflictSchema = z
   .object({
@@ -179,6 +201,7 @@ export const planConflictSchema = z
     area: z.enum(["files", "general-settings", "experiments", "plugin-settings", "keybindings", "appearance"]),
     target: z.string(),
     detail: z.string(),
+    skill: skillConflictInfoSchema.optional(),
   })
   .strict();
 
@@ -188,6 +211,8 @@ export const syncPlanSchema = z
     branch: z.string(),
     remoteHead: z.string(),
     remoteCapturedAt: z.string(),
+    /** Host name of the machine that published the preset last. */
+    remoteMachine: z.string().optional(),
     localCapturedAt: z.string(),
     changes: z.array(planChangeSchema),
     conflicts: z.array(planConflictSchema).default([]),
@@ -218,6 +243,8 @@ export const syncStatusSchema = z
     branch: z.string(),
     remoteHead: z.string(),
     remoteCapturedAt: z.string(),
+    /** Host name of the machine that published the preset last. */
+    remoteMachine: z.string().optional(),
     localCapturedAt: z.string(),
     stagedAt: z.string().nullable(),
     changeCount: z.number().int().nonnegative(),
@@ -325,6 +352,7 @@ export const MANAGED_PRESET_FILES = [
   "preset/plugin-settings.json",
   "preset/metadata.json",
   "preset/vendored.json",
+  "preset/skill-provenance.json",
 ] as const;
 
 async function assertPresetPathsSafe(repoDir: string): Promise<void> {
@@ -485,15 +513,46 @@ async function writePrettyJson(path: string, value: unknown): Promise<void> {
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+/** Who published the preset and where its skills were installed from. */
+export interface PresetExtras {
+  /** Host name of the machine that published last, shown as "OMEN" in the UI. */
+  machine?: string;
+  provenance: SkillProvenanceFile;
+}
+
+/** Read the optional extras; older presets without them return defaults. */
+export async function readPresetExtras(repoDir: string): Promise<PresetExtras> {
+  const presetDir = join(repoDir, "preset");
+  const [metadata, provenance] = await Promise.all([
+    readFile(join(presetDir, "metadata.json"), "utf8")
+      .then((text) => JSON.parse(text) as { machine?: unknown })
+      .catch(() => ({}) as { machine?: unknown }),
+    readFile(join(presetDir, "skill-provenance.json"), "utf8")
+      .then((text) => skillProvenanceFileSchema.safeParse(JSON.parse(text)))
+      .catch(() => null),
+  ]);
+  return {
+    machine:
+      typeof metadata.machine === "string" && metadata.machine.trim() !== ""
+        ? metadata.machine.trim().slice(0, 80)
+        : undefined,
+    provenance: provenance?.success === true ? provenance.data : EMPTY_PROVENANCE,
+  };
+}
+
 export async function writePresetSnapshot(
   repoDir: string,
   rawSnapshot: PresetSnapshot,
+  extras?: PresetExtras,
 ): Promise<void> {
   const snapshot = sortSnapshot(presetSnapshotSchema.parse(rawSnapshot));
   await assertPresetPathsSafe(repoDir);
   const presetDir = join(repoDir, "preset");
   await mkdir(presetDir, { recursive: true });
 
+  if (extras !== undefined) {
+    await writePrettyJson(join(presetDir, "skill-provenance.json"), extras.provenance);
+  }
   await Promise.all([
     writePrettyJson(join(presetDir, "settings.json"), {
       schemaVersion: PRESET_SCHEMA_VERSION,
@@ -516,6 +575,7 @@ export async function writePresetSnapshot(
       bbVersion: snapshot.bbVersion,
       capturedAt: snapshot.capturedAt,
       managedBy: "bb-plugin-preset-sync",
+      ...(extras?.machine === undefined ? {} : { machine: extras.machine }),
     }),
   ]);
 }
@@ -860,7 +920,8 @@ export interface FolderPlanSummary {
   add: number;
   update: number;
   skipped: number;
-  conflictPaths: string[];
+  /** One entry per conflicted skill, with its version evidence. */
+  conflictSkills: SkillConflictInfo[];
   blocked?: string;
 }
 
@@ -1185,12 +1246,14 @@ function folderChanges(
         risk: "configuration",
       });
     }
-    for (const path of folder.conflictPaths) {
+    for (const skill of folder.conflictSkills) {
+      const files = skill.paths.length === 1 ? "1 file differs" : `${skill.paths.length} files differ`;
       conflicts.push({
-        id: `conflict:files:${folder.collectionId}:${path}`,
+        id: `conflict:skill:${folder.collectionId}:${skill.skill}`,
         area: "files",
-        target: `${folder.target}/${path}`,
-        detail: "Changed here and in the preset since the last sync. Your version is kept until you choose.",
+        target: `${folder.target}/${skill.skill}`,
+        detail: `Changed here and in the preset since the last sync (${files}). Your version is kept until you choose.`,
+        skill,
       });
     }
   }
@@ -1322,6 +1385,7 @@ export function buildPullPlan(args: {
   localPluginSettingKeys?: ReadonlyMap<string, ReadonlySet<string>>;
   /** Every plugin installed here, also the ones the snapshot cannot record. */
   installedPluginIds?: ReadonlySet<string>;
+  remoteMachine?: string;
 }): SyncPlan {
   const { repository, branch, remoteHead } = args;
   const local = sortSnapshot(args.local);
@@ -1361,6 +1425,7 @@ export function buildPullPlan(args: {
     branch,
     remoteHead,
     remoteCapturedAt: remote.capturedAt,
+    ...(args.remoteMachine === undefined ? {} : { remoteMachine: args.remoteMachine }),
     localCapturedAt: local.capturedAt,
     changes,
     conflicts,

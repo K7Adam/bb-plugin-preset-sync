@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
 import { definePluginApp, useRealtime, useRpc, useSettings } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
-import type { ApplyResult, CachedSyncCheck, RestoreResult, SyncPlan, SyncStatus } from "./lib/preset";
+import type {
+  ApplyResult,
+  CachedSyncCheck,
+  RestoreResult,
+  SkillRule,
+  SyncPlan,
+  SyncStatus,
+} from "./lib/preset";
+import type { SkillGroup, SkillsOverview } from "./lib/skill-groups";
+import { SkillsPanel } from "./components/preset-sync/skills-panel";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -27,7 +36,7 @@ import { plural } from "./components/preset-sync/scope-model";
 
 type Pending =
   | { kind: "pull"; selection: string[]; resolutions: Record<string, ConflictChoice> }
-  | { kind: "publish" }
+  | { kind: "publish"; allowFlagged: boolean }
   | { kind: "undo" }
   | null;
 
@@ -83,6 +92,8 @@ function PresetSyncSettings() {
   const [notice, setNotice] = useState<string | null>(null);
   const [pullResult, setPullResult] = useState<ApplyResult | null>(null);
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
+  const [overview, setOverview] = useState<SkillsOverview | null>(null);
+  const [hits, setHits] = useState<{ where: string; term: string }[] | null>(null);
   const [pending, setPending] = useState<Pending>(null);
 
   const values = pluginSettings.values;
@@ -140,6 +151,54 @@ function PresetSyncSettings() {
     }
   };
 
+  const loadOverview = async () => {
+    setBusy("skills");
+    try {
+      setOverview(await rpc.call("sync_skills_overview"));
+      setError(null);
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const saveGroups = async (groups: SkillGroup[]) => {
+    setBusy("skills");
+    try {
+      await rpc.call("sync_save_skill_groups", { groups });
+      setPlan(null);
+      setOverview(await rpc.call("sync_skills_overview"));
+      setError(null);
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const saveRule = async (collectionId: string, skill: string, rule: SkillRule | null) => {
+    try {
+      await rpc.call("sync_set_skill_rule", { collectionId, skill, rule });
+    } catch (cause) {
+      setError(errorText(cause));
+    }
+  };
+
+  const startPublish = async () => {
+    setBusy("publish-check");
+    try {
+      const check = await rpc.call("sync_publish_check");
+      setHits(check.hits);
+      if (check.hits.length === 0) setPending({ kind: "publish", allowFlagged: false });
+      setError(null);
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const updateScope = async (next: Record<string, string | boolean>) => {
     setBusy("scope");
     try {
@@ -174,7 +233,8 @@ function PresetSyncSettings() {
         setPullResult(null);
         setError(null);
       } else {
-        const result = await rpc.call("sync_push", { fresh: true });
+        const result = await rpc.call("sync_push", { fresh: true, allowFlagged: action.allowFlagged });
+        setHits(null);
         setNotice(
           result.pushed
             ? `Published ${plural(result.changedFiles.length, "file", "files")} to the preset.`
@@ -214,6 +274,8 @@ function PresetSyncSettings() {
               busy={disabled}
               onClose={() => setPlan(null)}
               onApply={(selection, resolutions) => setPending({ kind: "pull", selection, resolutions })}
+              loadDetail={(conflictId) => rpc.call("sync_conflict_detail", { conflictId })}
+              onRule={saveRule}
             />
           )}
         </>
@@ -224,9 +286,18 @@ function PresetSyncSettings() {
         <PullResult result={pullResult} busy={disabled} onUndo={() => setPending({ kind: "undo" })} />
       )}
       {restoreResult === null ? null : <RestoreSummary result={restoreResult} />}
+      {configured ? (
+        <SkillsPanel overview={overview} busy={disabled} onLoad={() => void loadOverview()} onSaveGroups={(groups) => void saveGroups(groups)} />
+      ) : null}
       <ScopePanel values={values} disabled={disabled} onUpdate={updateScope} />
       {configured ? (
-        <PublishPanel status={status} busy={disabled} onPublish={() => setPending({ kind: "publish" })} />
+        <PublishPanel
+          status={status}
+          busy={disabled}
+          hits={hits}
+          onPublish={() => void startPublish()}
+          onPublishAnyway={() => setPending({ kind: "publish", allowFlagged: true })}
+        />
       ) : null}
 
       <Dialog open={pending !== null} onOpenChange={(open) => !open && setPending(null)}>

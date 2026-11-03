@@ -6,7 +6,13 @@
 import { createHash } from "node:crypto";
 import { cp, mkdir, readdir, readFile } from "node:fs/promises";
 import { join, relative } from "node:path";
-import { readPresetSnapshot, writePresetSnapshot, type PresetSnapshot } from "../../lib/preset";
+import {
+  readPresetExtras,
+  readPresetSnapshot,
+  writePresetSnapshot,
+  type PresetExtras,
+  type PresetSnapshot,
+} from "../../lib/preset";
 import {
   VENDORED_REPO_DIR,
   exportVendoredToRepo,
@@ -61,22 +67,25 @@ export async function readRemotePreset(options: {
   head: string;
   vendored: VendoredManifest;
   vendoredWarning?: string;
+  extras: PresetExtras;
 }> {
   const root = remoteDir(options.repositoryUrl);
-  const [snapshot, vendored, head] = await Promise.all([
+  const [snapshot, vendored, head, extras] = await Promise.all([
     readPresetSnapshot(root),
     readVendoredManifest(root),
     fakeHead(options.repositoryUrl),
+    readPresetExtras(root),
   ]);
   if (options.copyVendoredTo !== undefined && vendored.collections.length > 0) {
     await cp(join(root, VENDORED_REPO_DIR), options.copyVendoredTo, { recursive: true });
   }
-  return { snapshot, head, vendored };
+  return { snapshot, head, vendored, extras };
 }
 
 export async function pushRemotePreset(
   options: { repositoryUrl: string },
   snapshot: PresetSnapshot,
+  extras: PresetExtras,
   vendored?: {
     manifest: VendoredManifest;
     sourceDirs: Map<string, string>;
@@ -85,7 +94,7 @@ export async function pushRemotePreset(
 ): Promise<{ pushed: boolean; head: string; changedFiles: string[]; vendoredErrors: string[] }> {
   const root = remoteDir(options.repositoryUrl);
   await mkdir(root, { recursive: true });
-  await writePresetSnapshot(root, snapshot);
+  await writePresetSnapshot(root, snapshot, extras);
   const manifest = vendored?.manifest ?? { schemaVersion: 1 as const, collections: [] };
   await writeVendoredManifest(root, manifest);
   const exported =

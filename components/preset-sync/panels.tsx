@@ -1,5 +1,15 @@
 import { useState } from "react";
-import type { ApplyResult, PlanChange, PlanConflict, RestoreResult, SyncPlan, SyncStatus } from "../../lib/preset";
+import type {
+  ApplyResult,
+  PlanChange,
+  PlanConflict,
+  RestoreResult,
+  SkillRule,
+  SyncPlan,
+  SyncStatus,
+} from "../../lib/preset";
+import type { ConflictDetail } from "../../lib/skill-groups";
+import { SkillConflictCard } from "./conflict-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Icon } from "@/components/ui/icon";
@@ -285,17 +295,32 @@ function ConflictRow({
   );
 }
 
+/** The choice the evidence supports, or undefined when it is only a hint. */
+function recommendedChoice(conflict: PlanConflict): ConflictChoice | undefined {
+  const skill = conflict.skill;
+  if (skill === undefined || skill.hint) return undefined;
+  if (skill.newer === "remote") return "take-remote";
+  if (skill.newer === "local" || skill.newer === "same") return "keep-local";
+  return undefined;
+}
+
 export function ReviewPanel({
   plan,
   busy,
   onApply,
   onClose,
+  loadDetail,
+  onRule,
 }: {
   plan: SyncPlan;
   busy: boolean;
   onApply: (selection: string[], resolutions: Record<string, ConflictChoice>) => void;
   onClose: () => void;
+  loadDetail: (conflictId: string) => Promise<ConflictDetail>;
+  onRule: (collectionId: string, skill: string, rule: SkillRule | null) => Promise<void>;
 }) {
+  const machine = plan.remoteMachine ?? "the preset";
+  const recommendable = plan.conflicts.filter((conflict) => recommendedChoice(conflict) !== undefined);
   const [selected, setSelected] = useState<Set<string>>(() => new Set(plan.changes.map(changeId)));
   const [resolutions, setResolutions] = useState<Record<string, ConflictChoice>>({});
   const [showNotes, setShowNotes] = useState(false);
@@ -337,18 +362,46 @@ export function ReviewPanel({
             <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               Changed on both sides · {plural(plan.conflicts.length, "decision", "decisions")}
             </h3>
-            <p className="mb-2 text-xs text-muted-foreground">
-              Your version stays until you choose. Keep mine also tells Preset Sync not to ask again.
-            </p>
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs text-muted-foreground">
+                Your version stays until you choose. Keep mine also tells Preset Sync not to ask again.
+              </p>
+              {recommendable.length === 0 ? null : (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    setResolutions((previous) => ({
+                      ...previous,
+                      ...Object.fromEntries(recommendable.map((conflict) => [conflict.id, recommendedChoice(conflict)!])),
+                    }))
+                  }
+                >
+                  Take the newer version for {plural(recommendable.length, "skill", "skills")} with clear evidence
+                </Button>
+              )}
+            </div>
             <ul className="space-y-2">
-              {plan.conflicts.map((conflict) => (
-                <ConflictRow
-                  key={conflict.id}
-                  conflict={conflict}
-                  choice={resolutions[conflict.id]}
-                  onChoose={(next) => setResolutions((previous) => ({ ...previous, [conflict.id]: next }))}
-                />
-              ))}
+              {plan.conflicts.map((conflict) =>
+                conflict.skill === undefined ? (
+                  <ConflictRow
+                    key={conflict.id}
+                    conflict={conflict}
+                    choice={resolutions[conflict.id]}
+                    onChoose={(next) => setResolutions((previous) => ({ ...previous, [conflict.id]: next }))}
+                  />
+                ) : (
+                  <SkillConflictCard
+                    key={conflict.id}
+                    conflict={conflict}
+                    machine={machine}
+                    choice={resolutions[conflict.id]}
+                    onChoose={(next) => setResolutions((previous) => ({ ...previous, [conflict.id]: next }))}
+                    loadDetail={loadDetail}
+                    onRule={(rule) => onRule(conflict.skill!.collectionId, conflict.skill!.skill, rule)}
+                  />
+                ),
+              )}
             </ul>
           </section>
         )}
@@ -385,10 +438,15 @@ export function PublishPanel({
   status,
   busy,
   onPublish,
+  hits,
+  onPublishAnyway,
 }: {
   status: SyncStatus | null;
   busy: boolean;
   onPublish: () => void;
+  /** Blocked terms found by the last check; null when not checked yet. */
+  hits: { where: string; term: string }[] | null;
+  onPublishAnyway: () => void;
 }) {
   const changes = status?.pushChanges ?? [];
   return (
@@ -409,6 +467,28 @@ export function PublishPanel({
             ))}
           </ul>
         )}
+        {hits !== null && hits.length > 0 ? (
+          <div role="alert" className="space-y-2 rounded-md border border-destructive/50 p-3 text-sm">
+            <div className="font-medium text-destructive">
+              Not published: {plural(hits.length, "place contains", "places contain")} a term that must not leave this machine
+            </div>
+            <ul className="max-h-40 space-y-0.5 overflow-y-auto text-xs">
+              {hits.map((hit) => (
+                <li key={`${hit.where}-${hit.term}`}>
+                  <span className="font-mono">{hit.where}</span> · <span className="text-destructive">{hit.term}</span>
+                </li>
+              ))}
+            </ul>
+            <p className="text-xs text-muted-foreground">
+              Exclude these plugins or skills (Plugins to leave alone, or a skill group), or publish anyway if this is fine.
+            </p>
+            <div className="flex justify-end">
+              <Button size="sm" variant="destructive" disabled={busy} onClick={onPublishAnyway}>
+                Publish anyway
+              </Button>
+            </div>
+          </div>
+        ) : null}
         <div className="flex justify-end">
           <Button variant="outline" size="sm" disabled={busy || changes.length === 0} onClick={onPublish}>
             <Icon name="ArrowUp" />

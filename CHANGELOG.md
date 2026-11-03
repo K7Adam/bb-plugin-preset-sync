@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.0
+
+- Treat a skill as one unit: when any file of a skill changed on both sides,
+  the whole skill waits for one decision, so it never ends up half old, half
+  new.
+- Show which side of a conflicted skill is newer and why: an explicit
+  `metadata.version` first, then the skills installer's record of the same
+  source (`~/.agents/.skill-lock.json`, published as
+  `preset/skill-provenance.json`), and only as a marked hint the dates.
+- Show the difference of a conflicted skill file by file in BB's diff viewer,
+  with Keep mine, Use the other machine's version, a one-click "take the newer
+  version" for skills with clear evidence, and a remembered rule per skill
+  (always mine, always the preset, always the newer one).
+- Record the machine that published last, so the page says "OMEN is newer"
+  instead of "the preset".
+- Add skill groups per machine: named, skipped groups are neither pulled here
+  nor published from here, with live counts, matches and an estimate of the
+  startup tokens of all skills.
+- Add "Never publish these terms": a publish that would contain one stops and
+  lists every place; it continues only after "Publish anyway".
+- Add `bb preset skills` and `bb preset push --allow-flagged`.
+
 ## 0.3.1
 
 - Publishing no longer erases other machines from the preset: plugins,

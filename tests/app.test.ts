@@ -243,3 +243,147 @@ describe("plugin app registration", () => {
     indicator.lifecycle.unmount();
   });
 });
+
+describe("skills on the page", () => {
+  const skillConflict = {
+    id: "conflict:skill:agents-skills:deslop",
+    area: "files" as const,
+    target: "~/.agents/skills/deslop",
+    detail: "Changed here and in the preset since the last sync (1 file differs).",
+    skill: {
+      collectionId: "agents-skills",
+      skill: "deslop",
+      paths: ["deslop/SKILL.md"],
+      newer: "remote" as const,
+      evidence: "source" as const,
+      hint: false,
+      reason: "Both installed from acme/skills; updated later on OMEN (2026-10-30).",
+    },
+  };
+
+  it("shows which machine is newer, the difference and the remembered rule", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const plan = { ...((): SyncPlan => ({
+      repository,
+      branch: "main",
+      remoteHead: "0123456789abcdef",
+      remoteCapturedAt: "2026-11-02T19:35:32.049Z",
+      localCapturedAt: "2026-11-03T08:00:00.000Z",
+      remoteMachine: "OMEN",
+      changes: [],
+      conflicts: [skillConflict],
+      warnings: [],
+      fingerprint: "fp",
+    }))() };
+    const slot = track(
+      renderSlot(app.navPanels[0]!, { subPath: "" }, {
+        settings,
+        rpc: rpc({
+          sync_preview: () => plan,
+          sync_conflict_detail: () => ({
+            conflictId: skillConflict.id,
+            remoteMachine: "OMEN",
+            skill: skillConflict.skill,
+            files: [
+              {
+                path: "deslop/SKILL.md",
+                change: "differs",
+                patch: "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old line\n+new line\n",
+                lineEndingsOnly: false,
+                binary: false,
+              },
+            ],
+          }),
+          sync_set_skill_rule: () => ({ ok: true }),
+        }),
+      }),
+    );
+
+    fireEvent.click(await slot.findByRole("button", { name: "Review updates" }));
+    expect(await slot.findByText(/OMEN is newer/)).toBeTruthy();
+    expect(slot.getByText(/by install source/)).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: /Show differences/ }));
+    expect(await slot.findByText(/Lines with − are only in your copy/)).toBeTruthy();
+    fireEvent.change(slot.getByRole("combobox", { name: "Rule for deslop" }), { target: { value: "newer" } });
+    fireEvent.click(slot.getByRole("button", { name: /Take the newer version for 1 skill/ }));
+
+    await waitFor(() =>
+      expect(slot.inspection.rpcCalls.find((call) => call.method === "sync_set_skill_rule")?.input).toEqual({
+        collectionId: "agents-skills",
+        skill: "deslop",
+        rule: "newer",
+      }),
+    );
+    expect(slot.getByRole("button", { name: /Use OMEN's \(recommended\)/ }).getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("shows skill counts per folder and saves a skipped group", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const overview = {
+      remoteMachine: "OMEN",
+      groups: [],
+      folders: [
+        {
+          collectionId: "agents-skills",
+          target: "~/.agents/skills",
+          skills: [
+            { name: "android-cli", status: "new", here: false, inPreset: true, tokens: 60 },
+            { name: "deslop", status: "conflict", here: true, inPreset: true, tokens: 50 },
+          ],
+          counts: { here: 1, afterPull: 2, inPreset: 2, skipped: 0 },
+          tokensHere: 50,
+          tokensAfterPull: 110,
+        },
+      ],
+    };
+    const slot = track(
+      renderSlot(app.navPanels[0]!, { subPath: "" }, {
+        settings,
+        rpc: rpc({ sync_skills_overview: () => overview, sync_save_skill_groups: () => ({ ok: true }) }),
+      }),
+    );
+
+    fireEvent.click(await slot.findByRole("button", { name: "Show skills" }));
+    expect(await slot.findByText("~/.agents/skills")).toBeTruthy();
+    expect(slot.getByText("~50 → ~110 startup tokens")).toBeTruthy();
+    fireEvent.change(slot.getByRole("textbox", { name: "New group name" }), { target: { value: "Android" } });
+    fireEvent.change(slot.getByRole("textbox", { name: "New group patterns" }), { target: { value: "android-*" } });
+    expect(slot.getByText(/Matches 1: android-cli/)).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: /Add and skip/ }));
+
+    await waitFor(() =>
+      expect(slot.inspection.rpcCalls.find((call) => call.method === "sync_save_skill_groups")?.input).toEqual({
+        groups: [{ id: "android", name: "Android", patterns: ["android-*"], skip: true }],
+      }),
+    );
+  });
+
+  it("stops a publish with blocked terms until the user publishes anyway", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const slot = track(
+      renderSlot(app.navPanels[0]!, { subPath: "" }, {
+        settings,
+        rpc: rpc({
+          sync_publish_check: () => ({
+            hits: [{ where: "~/.agents/skills/venneker-website-doku/SKILL.md", term: "venneker" }],
+            terms: ["venneker"],
+          }),
+          sync_push: () => ({ pushed: true, head: "abc", capturedAt: "x", changedFiles: [], warnings: [] }),
+        }),
+      }),
+    );
+
+    fireEvent.click(await slot.findByRole("button", { name: /Publish 1 change/ }));
+    expect(await slot.findByText(/Not published: 1 place contains/)).toBeTruthy();
+    expect(slot.inspection.rpcCalls.some((call) => call.method === "sync_push")).toBe(false);
+    fireEvent.click(slot.getByRole("button", { name: "Publish anyway" }));
+    fireEvent.click(await slot.findByRole("button", { name: "Publish" }));
+
+    await waitFor(() =>
+      expect(slot.inspection.rpcCalls.find((call) => call.method === "sync_push")?.input).toEqual({
+        fresh: true,
+        allowFlagged: true,
+      }),
+    );
+  });
+});
