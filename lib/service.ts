@@ -1271,7 +1271,7 @@ export class PresetSyncService {
           signal: args.signal,
         },
         mergedSnapshot,
-        { machine: hostname(), provenance },
+        { machine: await this.machineName(args.signal), provenance },
         {
           manifest: { schemaVersion: 1, collections: mergedVendored },
           sourceDirs: rebuilt.sourceDirs,
@@ -1472,6 +1472,23 @@ export class PresetSyncService {
       if (published.has(name)) skills[name] = record;
     }
     return { schemaVersion: 1, skills };
+  }
+
+  /**
+   * The name other machines see as the publisher: this server's bb machine
+   * name (as in `bb machine list`), or the host name when BB has none.
+   */
+  private async machineName(signal?: AbortSignal): Promise<string> {
+    try {
+      const { primaryHostId } = await this.bb.sdk.system.config({ signal });
+      if (primaryHostId !== null && primaryHostId !== undefined) {
+        const host = await this.bb.sdk.hosts.get({ hostId: primaryHostId, signal });
+        if (host.name.trim() !== "") return host.name.trim();
+      }
+    } catch {
+      // Fall back to the host name below.
+    }
+    return hostname();
   }
 
   /** What a publish would send that contains a blocked term; nothing is pushed. */

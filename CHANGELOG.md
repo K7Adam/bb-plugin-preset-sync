@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.2
+
+- Name the publisher by its bb machine name (as in `bb machine list`, for
+  example "Work Venneker") instead of the Windows host name; the host name is
+  only the fallback. A changed name is published even when nothing else
+  changed.
+
 ## 0.4.1
 
 - Install plugins from BB's own marketplaces (bb-official, bb-community)

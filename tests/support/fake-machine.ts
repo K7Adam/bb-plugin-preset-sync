@@ -93,6 +93,8 @@ export interface MachineState {
   keybindingOverrides: unknown[];
   appearance: { themeId: string; faviconColor: string };
   plugins: FakePlugin[];
+  /** bb machine name of the server (system.config().primaryHostId -> hosts.get). */
+  machineName?: string;
 }
 
 export function baseSettings(overrides: Partial<SyncSettings> = {}): SyncSettings {
@@ -166,6 +168,7 @@ export async function createMachine(createHost: CreateHost, args: {
             experiments: { ...state.experiments },
             keybindingOverrides: [...state.keybindingOverrides],
             appearance: { ...state.appearance, customCss: null },
+            primaryHostId: state.machineName === undefined ? null : "host_server",
           }) as never,
         version: async () => ({ currentVersion: "0.48.2" }) as never,
         updateGeneralSettings: async (payload: Record<string, unknown>) => {
@@ -187,6 +190,12 @@ export async function createMachine(createHost: CreateHost, args: {
         updateKeyboardSettings: async (payload: unknown[]) => {
           state.keybindingOverrides = [...payload];
           return {} as never;
+        },
+      },
+      hosts: {
+        get: async ({ hostId }: { hostId: string }) => {
+          if (hostId !== "host_server" || state.machineName === undefined) throw new Error("404 host");
+          return { id: hostId, name: state.machineName, status: "connected", type: "persistent" } as never;
         },
       },
       theme: {

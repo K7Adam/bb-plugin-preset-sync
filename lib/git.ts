@@ -290,7 +290,8 @@ export async function pushRemotePreset(
       vendored !== undefined &&
       existingVendored !== null &&
       sameVendoredManifest(existingVendored, vendoredManifest) &&
-      sameJson(existingExtras.provenance, extras.provenance)
+      sameJson(existingExtras.provenance, extras.provenance) &&
+      existingExtras.machine === extras.machine
     ) {
       return { pushed: false, head: existingHead, changedFiles: [], vendoredErrors: [] };
     }

@@ -220,3 +220,25 @@ describe("conflict detail", () => {
     expect(detail.files[0]?.patch).toContain("+++ b/skills/s/SKILL.md");
   });
 });
+
+describe("publishing machine name", () => {
+  it("names the publisher by its bb machine name", async () => {
+    const work = await machine({ state: { machineName: "Work Venneker" } });
+    await put(work.home, "skills/a/SKILL.md", skill("a", "work"));
+    await push(work);
+    const omen = await machine();
+
+    const plan = await onMachine(omen, () => omen.service.preview());
+
+    expect(plan.remoteMachine).toBe("Work Venneker");
+  });
+
+  it("falls back to the host name when bb has no machine name", async () => {
+    const work = await machine();
+    await put(work.home, "skills/a/SKILL.md", skill("a", "work"));
+    await push(work);
+    const omen = await machine();
+
+    expect((await onMachine(omen, () => omen.service.preview())).remoteMachine).toBe(hostname());
+  });
+});
