@@ -38,6 +38,10 @@ export const syncBaseSchema = z
     appearance: jsonValue.optional(),
     /** Keyed by `pluginId.key`. */
     pluginSettings: z.record(z.string(), jsonValue),
+    /** Plugin ids this machine had and the preset listed at the last sync. */
+    plugins: z.array(z.string()).optional(),
+    /** Marketplace names this machine had and the preset listed at the last sync. */
+    marketplaces: z.array(z.string()).optional(),
   })
   .strict();
 

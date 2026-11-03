@@ -490,3 +490,115 @@ describe("rpc payloads", () => {
     }
   });
 });
+
+describe("publishing folders from several machines", () => {
+  it("keeps files this machine skips when it publishes", async () => {
+    const a = await machine();
+    await put(a.home, "skills/linked/x.md", "from a");
+    await put(a.home, "skills/private/p.md", "from a");
+    await put(a.home, "skills/shared.md", "shared");
+    await push(a);
+
+    const b = await machine({ settings: { vendorExcludeGlobs: "private/**" } });
+    const outside = await tempDir("preset-outside-");
+    await mkdir(join(b.home, "skills"), { recursive: true });
+    await symlink(outside, join(b.home, "skills", "linked"), "junction");
+    await onMachine(b, () => b.service.pullAndApply());
+    await put(b.home, "skills/own-b.md", "from b");
+    await push(b);
+
+    const plan = await onMachine(a, () => a.service.preview());
+    const status = await onMachine(a, () => a.service.status());
+
+    expect(plan.changes).toEqual([
+      expect.objectContaining({ id: "files:skills", summary: "Sync ~/skills: 1 new file" }),
+    ]);
+    expect(status.pushChanges.filter((change) => change.kind === "vendored")).toEqual([]);
+  });
+
+  it("removes a file from the preset when this machine deleted it after a sync", async () => {
+    const a = await machine();
+    await put(a.home, "skills/old.md", "old");
+    await put(a.home, "skills/keep.md", "keep");
+    await push(a);
+    const b = await machine();
+    await onMachine(b, () => b.service.pullAndApply());
+
+    await rm(join(b.home, "skills", "old.md"));
+    await push(b);
+    const c = await machine();
+    await onMachine(c, () => c.service.pullAndApply());
+
+    expect(await text(c.home, "skills/old.md")).toBeNull();
+    expect(await text(c.home, "skills/keep.md")).toBe("keep");
+  });
+
+  it("never syncs the bb-cli skill that bb installs on every machine", async () => {
+    const a = await machine();
+    await put(a.home, "skills/bb-cli/SKILL.md", "bb 0.48");
+    await put(a.home, "skills/own/SKILL.md", "own");
+    a.setSettings({ vendoredPaths: "~/.agents/skills" });
+    await put(a.home, ".agents/skills/bb-cli/SKILL.md", "bb 0.48");
+    await put(a.home, ".agents/skills/own/SKILL.md", "own");
+    await push(a);
+    const b = await machine({ settings: { vendoredPaths: "~/.agents/skills" } });
+    await put(b.home, ".agents/skills/bb-cli/SKILL.md", "bb 0.49");
+
+    const plan = await onMachine(b, () => b.service.preview());
+
+    expect(plan.conflicts).toEqual([]);
+    expect(plan.changes).toContainEqual(
+      expect.objectContaining({ summary: "Sync ~/.agents/skills: 1 new file" }),
+    );
+  });
+});
+
+describe("publishing plugins from several machines", () => {
+  const plugin = (id: string, source = `git:https://example.test/${id}.git`) => ({
+    id,
+    source,
+    enabled: true,
+  });
+  const self = { id: "preset-sync", source: "path:/p", enabled: true };
+
+  it("keeps plugins of other machines in the preset when this machine publishes", async () => {
+    const a = await machine({ state: { plugins: [self, plugin("only-a")] } });
+    await push(a);
+    const b = await machine({ state: { plugins: [self, plugin("only-b")] } });
+    await push(b);
+
+    const c = await machine({ state: { plugins: [self] } });
+    const plan = await onMachine(c, () => c.service.preview());
+    const status = await onMachine(a, () => a.service.status());
+
+    expect(plan.changes.map((change) => change.id).sort()).toEqual([
+      "plugin-install:only-a",
+      "plugin-install:only-b",
+    ]);
+    expect(status.pushChanges.filter((change) => change.action === "remove")).toEqual([]);
+  });
+
+  it("removes a plugin from the preset when this machine uninstalled it after a sync", async () => {
+    const a = await machine({ state: { plugins: [self, plugin("shared")] } });
+    await push(a);
+    const b = await machine({ state: { plugins: [self] } });
+    await onMachine(b, () => b.service.pullAndApply());
+    b.state.plugins = b.state.plugins.filter((entry) => entry.id !== "shared");
+    await push(b);
+
+    const c = await machine({ state: { plugins: [self] } });
+    const plan = await onMachine(c, () => c.service.preview());
+
+    expect(plan.changes.filter((change) => change.kind === "plugin-install")).toEqual([]);
+  });
+
+  it("does not offer to install a plugin this machine runs from a local folder", async () => {
+    const a = await machine({ state: { plugins: [self, plugin("tool")] } });
+    await push(a);
+    const b = await machine({ state: { plugins: [self, plugin("tool", "path:C:/dev/tool")] } });
+
+    const plan = await onMachine(b, () => b.service.preview());
+
+    expect(plan.changes.filter((change) => change.kind === "plugin-install")).toEqual([]);
+  });
+});

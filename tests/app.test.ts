@@ -1,9 +1,16 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { fireEvent, waitFor } from "@testing-library/react";
 import type { SyncPlan, SyncStatus } from "../lib/preset";
+
+// The first import transforms the whole app bundle; under a parallel full run
+// that alone can exceed a test timeout. Load it once up front so each test
+// measures only its own behaviour.
+beforeAll(async () => {
+  await loadPluginApp(() => import("../app"));
+}, 120_000);
 
 const repository = "https://github.com/example/preset.git";
 

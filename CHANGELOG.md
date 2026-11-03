@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1
+
+- Publishing no longer erases other machines from the preset: plugins,
+  marketplaces, their settings and folder files this machine does not have or
+  skips stay as other machines published them. Something leaves the preset only
+  when this machine had it at the last sync and removed it since.
+- Never sync the `bb-cli` skill, which bb installs on every machine itself.
+- A plugin installed here from a local folder is no longer offered for
+  installation from the preset.
+- Load the app once before the UI tests so a cold start under a parallel run
+  cannot exceed a test timeout.
+
 ## 0.3.0
 
 - Decide every setting and file three-way against the last sync: changes made

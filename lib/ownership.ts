@@ -60,9 +60,14 @@ export const FIXED_LOCAL_EXPERIMENTS: ReadonlySet<string> = new Set([
 const MACHINE_PLUGIN_SETTING_KEY =
   /(?:command|path|dir|directory|home|folder|executable|binary)$/i;
 
-/** Sub-folders another application manages inside a synced folder. */
+/**
+ * Sub-folders another application manages inside a synced folder. bb installs
+ * bb-cli into both global skill roots per machine (`bb skill install-cli-skills`)
+ * and replaces it on updates; the Claude app owns ~/.claude/skills/synced.
+ */
 export const APP_MANAGED_SUBFOLDERS: Readonly<Record<string, readonly string[]>> = {
-  "~/.claude/skills": ["synced/**"],
+  "~/.agents/skills": ["bb-cli/**"],
+  "~/.claude/skills": ["synced/**", "bb-cli/**"],
 };
 
 export interface OwnershipChoices {

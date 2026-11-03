@@ -105,6 +105,12 @@ plugin paths or commands** to sync them anyway.
 Publishing never overwrites another machine's values for settings this machine
 does not sync.
 
+Publishing also never removes what other machines contributed: plugins,
+marketplaces and folder files this machine does not have, skips or excludes
+stay in the preset. Something leaves the preset only when this machine had it at
+the last sync and removed it since. The `bb-cli` skill, which bb installs on
+every machine, is never synced.
+
 ## Sync scope
 
 The **What this machine syncs** panel on the Preset Sync page switches areas on

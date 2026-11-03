@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-preset-sync",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Synchronize portable BB plugins and settings across computers through a Git repository.",
   "type": "module",
   "license": "MIT",

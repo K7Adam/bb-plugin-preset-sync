@@ -677,10 +677,32 @@ async function removeEmptyDirs(
  * the repo already carries (they are owned by another machine); directories no
  * longer referenced by the manifest are pruned.
  */
+async function listFilesBelow(root: string, rel = ""): Promise<string[]> {
+  const entries = await readdir(rel === "" ? root : join(root, ...rel.split("/")), {
+    withFileTypes: true,
+  }).catch(() => [] as import("node:fs").Dirent[]);
+  const files: string[] = [];
+  for (const entry of entries) {
+    const child = rel === "" ? entry.name : `${rel}/${entry.name}`;
+    if (entry.isDirectory()) files.push(...(await listFilesBelow(root, child)));
+    else files.push(child);
+  }
+  return files;
+}
+
+/**
+ * Copy vendored payloads described by a manifest from live source dirs into a
+ * cloned preset repository. Collections without a local source keep whatever
+ * the repo already carries (they are owned by another machine). `preserved`
+ * lists, per collection, entries this machine does not manage: their committed
+ * files stay as they are. Files and directories the manifest no longer
+ * references are pruned.
+ */
 export async function exportVendoredToRepo(args: {
   repoDir: string;
   manifest: VendoredManifest;
   sourceDirs: Map<string, string>;
+  preserved?: Map<string, Set<string>>;
 }): Promise<{ copied: number; errors: string[] }> {
   const errors: string[] = [];
   let copied = 0;
@@ -717,10 +739,23 @@ export async function exportVendoredToRepo(args: {
       continue;
     }
     if (sourceDir === undefined) continue; // foreign-owned: keep repo content
-    await rm(targetRoot, { recursive: true, force: true });
+    const keep = args.preserved?.get(collection.id) ?? new Set<string>();
+    const wanted = new Set(collection.entries.map((entry) => entry.path));
+    for (const rel of await listFilesBelow(targetRoot)) {
+      if (!wanted.has(rel) || !keep.has(rel)) {
+        await rm(resolveWithin(targetRoot, rel), { force: true });
+      }
+    }
     for (const entry of collection.entries) {
       if (!isValidVendoredRelPath(entry.path)) {
         errors.push(`${collection.id}/${entry.path}: invalid path`);
+        continue;
+      }
+      if (keep.has(entry.path)) {
+        const committed = await readFile(resolveWithin(targetRoot, entry.path)).catch(() => null);
+        if (committed === null || sha256Hex(committed) !== entry.sha256) {
+          errors.push(`${collection.id}/${entry.path}: preserved file is missing in the preset`);
+        }
         continue;
       }
       try {
@@ -739,6 +774,12 @@ export async function exportVendoredToRepo(args: {
           `${collection.id}/${entry.path}: ${(cause as Error).message}`,
         );
       }
+    }
+  }
+
+  for (const collection of args.manifest.collections) {
+    if (args.sourceDirs.has(collection.id) && isValidVendoredRepoDir(collection.repoDir)) {
+      await removeEmptyDirs(resolveWithin(args.repoDir, collection.repoDir), new Set());
     }
   }
 

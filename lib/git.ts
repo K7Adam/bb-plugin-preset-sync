@@ -242,7 +242,11 @@ export async function readRemotePreset(
 export async function pushRemotePreset(
   options: GitPushOptions,
   snapshot: PresetSnapshot,
-  vendored?: { manifest: VendoredManifest; sourceDirs: Map<string, string> },
+  vendored?: {
+    manifest: VendoredManifest;
+    sourceDirs: Map<string, string>;
+    preserved?: Map<string, Set<string>>;
+  },
 ): Promise<{
   pushed: boolean;
   head: string;
@@ -291,6 +295,7 @@ export async function pushRemotePreset(
         repoDir,
         manifest: vendoredManifest,
         sourceDirs: vendored.sourceDirs,
+        preserved: vendored.preserved,
       });
       vendoredErrors.push(...exported.errors);
     } else {

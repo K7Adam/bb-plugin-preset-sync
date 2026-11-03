@@ -77,7 +77,11 @@ export async function readRemotePreset(options: {
 export async function pushRemotePreset(
   options: { repositoryUrl: string },
   snapshot: PresetSnapshot,
-  vendored?: { manifest: VendoredManifest; sourceDirs: Map<string, string> },
+  vendored?: {
+    manifest: VendoredManifest;
+    sourceDirs: Map<string, string>;
+    preserved?: Map<string, Set<string>>;
+  },
 ): Promise<{ pushed: boolean; head: string; changedFiles: string[]; vendoredErrors: string[] }> {
   const root = remoteDir(options.repositoryUrl);
   await mkdir(root, { recursive: true });
@@ -87,7 +91,7 @@ export async function pushRemotePreset(
   const exported =
     vendored === undefined
       ? { errors: [] as string[] }
-      : await exportVendoredToRepo({ repoDir: root, manifest, sourceDirs: vendored.sourceDirs });
+      : await exportVendoredToRepo({ repoDir: root, manifest, sourceDirs: vendored.sourceDirs, preserved: vendored.preserved });
   return {
     pushed: true,
     head: await fakeHead(options.repositoryUrl),

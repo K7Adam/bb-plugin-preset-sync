@@ -230,7 +230,13 @@ export async function createMachine(createHost: CreateHost, args: {
           return {} as never;
         },
         install: async ({ source }: { source: string }) => {
-          state.plugins.push({ id: source.replace(/^.*[/:]/, ""), source, enabled: true });
+          // bb derives the id from the repository or package name: git:https://x/tool.git@main -> tool
+          const id = source
+            .replace(/@[^/@]*$/, "")
+            .replace(/\.git$/, "")
+            .replace(/^.*[/:]/, "")
+            .replace(/^bb-plugin-/, "");
+          state.plugins.push({ id, source, enabled: true });
           return {} as never;
         },
         enable: async ({ pluginId }: { pluginId: string }) => {

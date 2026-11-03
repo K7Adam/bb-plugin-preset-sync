@@ -48,8 +48,11 @@ import {
   VendorError,
   collectionIdForPath,
   expandHome,
+  hashCollectionEntries,
   isValidVendoredId,
+  matchesGlob,
   parseGlobList,
+  symlinkedParent,
   readVendorState,
   recordVendorApplied,
   toHomeRelative,
@@ -137,9 +140,11 @@ interface CapturedPreset {
   vendoredSourceDirs: Map<string, string>;
   /** Setting keys each installed plugin declares on this machine. */
   pluginSettingKeys: Map<string, Set<string>>;
+  /** Every installed plugin, including local-path ones the snapshot cannot record. */
+  installedPluginIds: Set<string>;
 }
 
-interface StagedPreset extends Omit<CapturedPreset, "pluginSettingKeys"> {
+interface StagedPreset extends Omit<CapturedPreset, "pluginSettingKeys" | "installedPluginIds"> {
   stagedAt: string;
 }
 
@@ -224,6 +229,50 @@ export function mergeVendoredForPush(args: {
     merged.push(collection);
   }
   return merged;
+}
+
+/**
+ * Publish a folder without erasing what this machine does not manage. Files it
+ * skips (excluded, app-managed, under a symbolic link) or never received stay
+ * as other machines published them. A file leaves the preset only when this
+ * machine had exactly that version at the last sync and deleted it since.
+ */
+export async function mergeFolderForPush(args: {
+  local: VendoredCollection;
+  remote: VendoredCollection | undefined;
+  baseFiles: Record<string, string> | undefined;
+  sourceDir: string;
+  excludeGlobs: readonly string[];
+}): Promise<{ collection: VendoredCollection; preserved: Set<string> }> {
+  const { local, remote } = args;
+  if (remote === undefined || remote.kind !== "files") {
+    return { collection: local, preserved: new Set() };
+  }
+  const localPaths = new Set(local.entries.map((entry) => entry.path));
+  const preserved = new Set<string>();
+  for (const entry of remote.entries) {
+    if (localPaths.has(entry.path)) continue;
+    const skippedHere =
+      args.excludeGlobs.some((glob) => matchesGlob(entry.path, glob)) ||
+      (await symlinkedParent(args.sourceDir, entry.path)) !== null;
+    const deletedHere = !skippedHere && args.baseFiles?.[entry.path] === entry.sha256;
+    if (!deletedHere) preserved.add(entry.path);
+  }
+  if (preserved.size === 0) return { collection: local, preserved };
+  const entries = [
+    ...local.entries,
+    ...remote.entries.filter((entry) => preserved.has(entry.path)),
+  ].sort((left, right) => left.path.localeCompare(right.path));
+  return {
+    collection: {
+      ...local,
+      entries,
+      hash: hashCollectionEntries(entries),
+      fileCount: entries.length,
+      bytes: entries.reduce((sum, entry) => sum + entry.size, 0),
+    },
+    preserved,
+  };
 }
 
 function unique(values: string[]): string[] {
@@ -587,6 +636,7 @@ export class PresetSyncService {
       vendored: collected.vendored,
       vendoredSourceDirs: collected.vendoredSourceDirs,
       pluginSettingKeys: pluginSettings.keys,
+      installedPluginIds: new Set(pluginList.plugins.map((plugin) => plugin.id)),
       warnings: unique(collected.warnings),
     };
   }
@@ -675,8 +725,40 @@ export class PresetSyncService {
         };
       }),
       localPluginSettingKeys: local.pluginSettingKeys,
+      installedPluginIds: local.installedPluginIds,
     });
     return { settings, scope, remote, remoteScoped, local, applied, base, folders, plan };
+  }
+
+  /** Folder collections as a push would publish them (see mergeFolderForPush). */
+  private async mergeFoldersForPush(args: {
+    local: VendoredCollection[];
+    sourceDirs: Map<string, string>;
+    remote: VendoredManifest | null;
+    applied: VendorAppliedState;
+    settings: SyncSettings;
+  }): Promise<{ collections: VendoredCollection[]; preserved: Map<string, Set<string>> }> {
+    const remoteById = new Map((args.remote?.collections ?? []).map((entry) => [entry.id, entry]));
+    const localExcludes = parseGlobList(args.settings.vendorExcludeGlobs);
+    const preserved = new Map<string, Set<string>>();
+    const collections: VendoredCollection[] = [];
+    for (const collection of args.local) {
+      const sourceDir = args.sourceDirs.get(collection.id);
+      if (collection.kind !== "files" || sourceDir === undefined) {
+        collections.push(collection);
+        continue;
+      }
+      const merged = await mergeFolderForPush({
+        local: collection,
+        remote: remoteById.get(collection.id),
+        baseFiles: args.applied.collections[collection.id]?.files,
+        sourceDir,
+        excludeGlobs: [...localExcludes, ...appManagedExcludes(collection.target)],
+      });
+      collections.push(merged.collection);
+      if (merged.preserved.size > 0) preserved.set(collection.id, merged.preserved);
+    }
+    return { collections, preserved };
   }
 
   async preview(signal?: AbortSignal): Promise<SyncPlan> {
@@ -685,17 +767,27 @@ export class PresetSyncService {
 
   async status(signal?: AbortSignal) {
     return this.exclusive(async () => {
-      const { remote, local, scope, settings, plan } = await this.gather(signal);
+      const { remote, local, scope, settings, plan, applied, base } = await this.gather(signal);
       const [staged, lastOperation] = await Promise.all([
         this.readStaged(),
         this.readLastOperation(),
       ]);
-      const merged = mergePresetForPush(local.snapshot, remote.snapshot, scope);
+      const merged = mergePresetForPush(local.snapshot, remote.snapshot, scope, {
+        base,
+        installedPluginIds: local.installedPluginIds,
+      });
+      const folders = await this.mergeFoldersForPush({
+        local: applyVendoredScope(local.vendored, scope),
+        sourceDirs: local.vendoredSourceDirs,
+        remote: remote.vendored,
+        applied,
+        settings,
+      });
       const pushChanges = buildPushChanges(merged, remote.snapshot, {
         local: {
           schemaVersion: 1,
           collections: mergeVendoredForPush({
-            local: applyVendoredScope(local.vendored, scope),
+            local: folders.collections,
             remote: remote.vendored,
             mergedPlugins: merged.plugins,
             scope,
@@ -925,12 +1017,21 @@ export class PresetSyncService {
   /** After a push both sides agree: record the published values as the base. */
   private async recordPushedBase(
     snapshot: PresetSnapshot,
+    published: PresetSnapshot,
+    installedPluginIds: ReadonlySet<string>,
     scope: SyncScope,
     pushedFolders: VendoredCollection[],
   ): Promise<void> {
     const base = await this.readBase();
+    const localMarketplaces = new Set(snapshot.marketplaces.map((entry) => entry.name));
     const next: SyncBase = {
       ...base,
+      plugins: published.plugins
+        .map((entry) => entry.id)
+        .filter((id) => installedPluginIds.has(id)),
+      marketplaces: published.marketplaces
+        .map((entry) => entry.name)
+        .filter((name) => localMarketplaces.has(name)),
       general: { ...base.general, ...snapshot.settings.generalSettings },
       experiments: { ...base.experiments, ...snapshot.settings.experiments },
       pluginSettings: {
@@ -978,19 +1079,28 @@ export class PresetSyncService {
         remoteSnapshot = null;
         remoteVendored = null;
       }
-      const mergedSnapshot = mergePresetForPush(
-        staged.snapshot,
-        remoteSnapshot,
-        scope,
+      const installedPluginIds = new Set(
+        (await this.bb.sdk.plugins.list({ signal: args.signal })).plugins.map((plugin) => plugin.id),
       );
+      const mergedSnapshot = mergePresetForPush(staged.snapshot, remoteSnapshot, scope, {
+        base: await this.readBase(),
+        installedPluginIds,
+      });
       const rebuilt = await this.rebuildVendoredForPush(
         staged,
         settings,
         scope,
         args.signal,
       );
-      const mergedVendored = mergeVendoredForPush({
+      const folders = await this.mergeFoldersForPush({
         local: rebuilt.collections,
+        sourceDirs: rebuilt.sourceDirs,
+        remote: remoteVendored,
+        applied: await readVendorState(),
+        settings,
+      });
+      const mergedVendored = mergeVendoredForPush({
+        local: folders.collections,
         remote: remoteVendored,
         mergedPlugins: mergedSnapshot.plugins,
         scope,
@@ -1009,11 +1119,14 @@ export class PresetSyncService {
         {
           manifest: { schemaVersion: 1, collections: mergedVendored },
           sourceDirs: rebuilt.sourceDirs,
+          preserved: folders.preserved,
         },
       );
       const pushedIds = new Set(mergedVendored.map((collection) => collection.id));
       await this.recordPushedBase(
         staged.snapshot,
+        mergedSnapshot,
+        installedPluginIds,
         scope,
         rebuilt.collections.filter(
           (collection) => collection.kind === "files" && pushedIds.has(collection.id),
@@ -1110,7 +1223,23 @@ export class PresetSyncService {
           runProcess: (command, args, cwd) => this.runProcess(command, args, cwd),
           signal: options.signal,
         });
-        await this.writeBase(outcome.base);
+        // Plugins and marketplaces both sides now have: removing one here later
+        // removes it from the preset on the next publish.
+        const [installedAfter, marketplacesAfter] = await Promise.all([
+          this.bb.sdk.plugins.list({ signal: options.signal }),
+          this.bb.sdk.plugins.marketplaces.list({ signal: options.signal }),
+        ]);
+        const installedIds = new Set(installedAfter.plugins.map((plugin) => plugin.id));
+        const marketplaceNames = new Set(marketplacesAfter.map((entry) => entry.name));
+        await this.writeBase({
+          ...outcome.base,
+          plugins: gathered.remoteScoped.snapshot.plugins
+            .map((entry) => entry.id)
+            .filter((id) => installedIds.has(id)),
+          marketplaces: gathered.remoteScoped.snapshot.marketplaces
+            .map((entry) => entry.name)
+            .filter((name) => marketplaceNames.has(name)),
+        });
         await writeVendorState({ collections: outcome.folderState });
         const saved = await journal.save();
 

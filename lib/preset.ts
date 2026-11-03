@@ -626,13 +626,35 @@ export function applySyncScope(
   };
 }
 
+export interface PushMergeContext {
+  /** Plugin ids and marketplace names agreed at this machine's last sync. */
+  base?: { plugins?: readonly string[]; marketplaces?: readonly string[] };
+  /** Every plugin installed here, also the ones the snapshot cannot record (local paths). */
+  installedPluginIds?: ReadonlySet<string>;
+}
+
+/**
+ * Publish this machine without erasing other machines: preset plugins and
+ * marketplaces this machine does not have stay, unless it had them at the last
+ * sync and removed them since.
+ */
 export function mergePresetForPush(
   local: PresetSnapshot,
   remote: PresetSnapshot | null,
   scope: SyncScope,
+  context: PushMergeContext = {},
 ): PresetSnapshot {
   const remotePlugins = remote?.plugins ?? [];
   const remoteSettings = remote?.pluginSettings ?? [];
+  const localPluginIds = new Set(local.plugins.map((entry) => entry.id));
+  const installedHere = (id: string) =>
+    localPluginIds.has(id) || (context.installedPluginIds?.has(id) ?? false);
+  const basePlugins = new Set(context.base?.plugins ?? []);
+  const keepRemotePlugin = (id: string) =>
+    !localPluginIds.has(id) &&
+    (scope.excludedPlugins.has(id) || installedHere(id) || !basePlugins.has(id));
+  const localMarketplaceNames = new Set(local.marketplaces.map((entry) => entry.name));
+  const baseMarketplaces = new Set(context.base?.marketplaces ?? []);
   const remoteGeneral = remote?.settings.generalSettings ?? {};
   const remoteExperiments = remote?.settings.experiments ?? {};
   // Values this machine does not sync stay as other machines published them.
@@ -644,24 +666,22 @@ export function mergePresetForPush(
   return {
     ...local,
     plugins: scope.syncPlugins
-      ? [
-          ...local.plugins,
-          ...remotePlugins.filter(
-            (entry) =>
-              scope.excludedPlugins.has(entry.id) &&
-              !local.plugins.some((own) => own.id === entry.id),
-          ),
-        ]
+      ? [...local.plugins, ...remotePlugins.filter((entry) => keepRemotePlugin(entry.id))]
       : remotePlugins,
     marketplaces: scope.syncMarketplaces
-      ? local.marketplaces
+      ? [
+          ...local.marketplaces,
+          ...(remote?.marketplaces ?? []).filter(
+            (entry) => !localMarketplaceNames.has(entry.name) && !baseMarketplaces.has(entry.name),
+          ),
+        ]
       : (remote?.marketplaces ?? []),
     pluginSettings: scope.syncPluginSettings
       ? [
           ...local.pluginSettings,
           ...remoteSettings.filter(
             (entry) =>
-              !isPluginSettingInScope(scope, entry) &&
+              (!isPluginSettingInScope(scope, entry) || keepRemotePlugin(entry.id)) &&
               !local.pluginSettings.some(
                 (own) => own.id === entry.id && own.key === entry.key,
               ),
@@ -1000,6 +1020,7 @@ function marketplaceAndPluginChanges(
   appliedVendored: VendorAppliedState,
   changes: PlanChange[],
   warnings: string[],
+  installedPluginIds: ReadonlySet<string> = new Set(),
 ): void {
   const vendoredPluginCollections = new Map(
     remoteVendored.collections
@@ -1037,6 +1058,13 @@ function marketplaceAndPluginChanges(
     if (plugin.id === SELF_PLUGIN_ID) continue;
     const current = localPlugins.get(plugin.id);
     const vendoredCollection = vendoredPluginCollections.get(plugin.id);
+    if (current === undefined && installedPluginIds.has(plugin.id)) {
+      // Installed here from a source the preset does not record (a local folder).
+      warnings.push(
+        `Plugin ${plugin.id} is installed from another source; Preset Sync will not replace it automatically.`,
+      );
+      continue;
+    }
     if (current === undefined) {
       if (vendoredPluginId(plugin.install) !== null) {
         if (vendoredCollection === undefined) {
@@ -1292,6 +1320,8 @@ export function buildPullPlan(args: {
   /** Per-file folder plans; when given they replace the hash-only folder check. */
   folders?: FolderPlanSummary[];
   localPluginSettingKeys?: ReadonlyMap<string, ReadonlySet<string>>;
+  /** Every plugin installed here, also the ones the snapshot cannot record. */
+  installedPluginIds?: ReadonlySet<string>;
 }): SyncPlan {
   const { repository, branch, remoteHead } = args;
   const local = sortSnapshot(args.local);
@@ -1302,7 +1332,15 @@ export function buildPullPlan(args: {
   const conflicts: PlanConflict[] = [];
   const warnings = [...(args.warnings ?? [])];
 
-  marketplaceAndPluginChanges(local, remote, remoteVendored, appliedVendored, changes, warnings);
+  marketplaceAndPluginChanges(
+    local,
+    remote,
+    remoteVendored,
+    appliedVendored,
+    changes,
+    warnings,
+    args.installedPluginIds,
+  );
   folderChanges({ folders: args.folders, remoteVendored, appliedVendored }, changes, conflicts, warnings);
   const decisions = planSettingDecisions({
     local,
