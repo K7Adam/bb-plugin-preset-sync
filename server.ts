@@ -6,8 +6,10 @@ import {
   captureResultSchema,
   errorMessage,
   pushResultSchema,
+  restoreResultSchema,
   syncPlanSchema,
   syncStatusSchema,
+  SELF_PLUGIN_ID,
   type SyncPlan,
 } from "./lib/preset";
 import { PresetSyncService } from "./lib/service";
@@ -39,8 +41,48 @@ export const rpcContract = defineRpcContract({
     output: pushResultSchema,
   },
   sync_pull: {
-    input: z.object({ confirmed: z.literal(true) }).strict(),
+    input: z
+      .object({
+        confirmed: z.literal(true),
+        /** Fingerprint of the plan the user reviewed. */
+        fingerprint: z.string().min(1).optional(),
+        selectedChangeIds: z.array(z.string().min(1)).max(500).optional(),
+        resolutions: z
+          .record(z.string().min(1), z.enum(["keep-local", "take-remote"]))
+          .optional(),
+      })
+      .strict(),
     output: applyResultSchema,
+  },
+  sync_restore: {
+    input: z.object({ confirmed: z.literal(true) }).strict(),
+    output: restoreResultSchema,
+  },
+  /** Change what this machine syncs; only these keys can be written from the page. */
+  sync_update_scope: {
+    input: z
+      .object({
+        values: z
+          .object({
+            syncPlugins: z.boolean(),
+            includePluginSettings: z.boolean(),
+            syncGeneralSettings: z.boolean(),
+            syncExperiments: z.boolean(),
+            syncKeybindings: z.boolean(),
+            syncAppearance: z.boolean(),
+            syncMarketplaces: z.boolean(),
+            syncVendoredFiles: z.boolean(),
+            syncVendoredPlugins: z.boolean(),
+            vendoredPaths: z.string().max(4_000),
+            vendorExcludeGlobs: z.string().max(4_000),
+            vendorConflictMode: z.enum(["skip", "backup"]),
+          })
+          .partial()
+          .strict()
+          .refine((values) => Object.keys(values).length > 0, "Nothing to update"),
+      })
+      .strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
   },
 });
 
@@ -50,12 +92,14 @@ const usage = [
   "  bb preset diff [--json]",
   "  bb preset capture [--json]",
   "  bb preset push [--fresh] [--message <text>] [--json]",
-  "  bb preset pull --yes [--json]",
+  "  bb preset pull --yes [--plan <fingerprint>] [--only <id,id>] [--json]",
+  "  bb preset restore --yes [--json]",
   "",
-  "Pull is additive: local plugins absent from the preset are kept.",
+  "Pull never removes anything: plugins and files missing from the preset stay.",
+  "Machine settings (provider order, server URL, paths) stay on each machine.",
+  "A file or setting changed here and in the preset is kept and shown as a conflict.",
+  "Every pull backs up what it replaces; restore undoes the most recent pull.",
   "Secret settings, credentials, sessions, and runtime data are never captured.",
-  "Local-path plugins and configured home directories (skills, prompts) are",
-  "vendored into the preset; pull materializes them without deleting extras.",
 ].join("\n");
 
 function planText(plan: SyncPlan): string {
@@ -63,11 +107,23 @@ function planText(plan: SyncPlan): string {
     `${plan.changes.length} change${plan.changes.length === 1 ? "" : "s"} from ${plan.repository}#${plan.branch}`,
     `Remote: ${plan.remoteHead.slice(0, 12)} (captured ${plan.remoteCapturedAt})`,
   ];
-  if (plan.changes.length === 0) lines.push("Preset already matches this machine.");
+  if (plan.changes.length === 0) lines.push("Nothing to apply from the preset.");
   for (const change of plan.changes) {
-    lines.push(`  ${change.risk === "full-trust" ? "!" : "+"} ${change.summary}`);
+    lines.push(
+      `  ${change.risk === "full-trust" ? "!" : "+"} ${change.summary}  [${change.id ?? change.kind}]`,
+    );
+    if (change.detail !== undefined) lines.push(`      ${change.detail}`);
+  }
+  if (plan.conflicts.length > 0) {
+    lines.push(
+      `${plan.conflicts.length} conflict${plan.conflicts.length === 1 ? "" : "s"}, your version is kept:`,
+    );
+    for (const conflict of plan.conflicts) {
+      lines.push(`  ~ ${conflict.target}: ${conflict.detail}`);
+    }
   }
   for (const warning of plan.warnings) lines.push(`  ! ${warning}`);
+  lines.push(`Plan: ${plan.fingerprint}`);
   return lines.join("\n");
 }
 
@@ -76,12 +132,15 @@ function parsePositiveInt(value: string | boolean | undefined, fallback: number)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function parseMessage(argv: string[]): { ok: true; message?: string } | { ok: false } {
-  const index = argv.indexOf("--message");
+function parseOption(
+  argv: string[],
+  name: string,
+): { ok: true; value?: string } | { ok: false } {
+  const index = argv.indexOf(name);
   if (index === -1) return { ok: true };
-  const message = argv[index + 1];
-  if (message === undefined || message.startsWith("--")) return { ok: false };
-  return { ok: true, message };
+  const value = argv[index + 1];
+  if (value === undefined || value.startsWith("--")) return { ok: false };
+  return { ok: true, value };
 }
 
 export default async function plugin(bb: BbPluginApi) {
@@ -89,7 +148,8 @@ export default async function plugin(bb: BbPluginApi) {
     repositoryUrl: {
       type: "string",
       label: "Preset repository",
-      description: "Git repository containing preset/*.json. HTTPS and SSH URLs are supported.",
+      description:
+        "Git repository that stores the preset (HTTPS or SSH). Use a private repository you own.",
     },
     branch: {
       type: "string",
@@ -116,16 +176,16 @@ export default async function plugin(bb: BbPluginApi) {
     },
     includePluginSettings: {
       type: "boolean",
-      label: "Capture non-secret plugin settings",
+      label: "Sync plugin settings",
       description:
-        "Secret descriptors and suspicious credential-like keys are always excluded.",
+        "Non-secret plugin settings. Secrets, credential-like values and paths or commands of this machine always stay here.",
       default: true,
     },
     backgroundCheckInterval: {
       type: "select",
       label: "Background check interval",
       description:
-        "How often to compare this BB installation with the Git preset. Select Off to disable background checks.",
+        "How often to compare this BB installation with the preset. Checks never change anything. Select Off to disable them.",
       options: ["Off", "1 minute", "5 minutes", "10 minutes", "15 minutes", "30 minutes", "60 minutes"],
       default: "5 minutes",
     },
@@ -133,122 +193,136 @@ export default async function plugin(bb: BbPluginApi) {
       type: "boolean",
       label: "Sync plugins",
       description:
-        "Capture, install, and enable/disable plugins through the preset. When off, the preset keeps whatever the remote already records.",
+        "Install plugins from the preset and match enabled or disabled. Plugins missing from the preset are never removed.",
       default: true,
     },
     syncMarketplaces: {
       type: "boolean",
       label: "Sync marketplaces",
-      description: "Sync third-party plugin marketplaces.",
+      description: "Add third-party plugin marketplaces recorded in the preset.",
       default: true,
     },
     syncGeneralSettings: {
       type: "boolean",
-      label: "Sync general settings",
-      description: "Sync general BB settings through the preset.",
+      label: "Sync BB preferences",
+      description:
+        "Preferences such as shortcut hints or the branch prefix. Machine settings (server URL, machine access, provider order, default provider) stay here unless listed below.",
       default: true,
     },
     syncExperiments: {
       type: "boolean",
-      label: "Sync experiment flags",
-      description: "Sync BB experiment flags.",
+      label: "Sync experiments",
+      description:
+        "Experiment flags. Performance diagnostics and server move always stay on this machine.",
       default: true,
     },
     syncKeybindings: {
       type: "boolean",
       label: "Sync keyboard shortcuts",
-      description: "Sync keyboard shortcut overrides.",
+      description: "Keyboard shortcut overrides.",
       default: true,
     },
     syncAppearance: {
       type: "boolean",
-      label: "Sync appearance",
-      description: "Sync theme and favicon color.",
-      default: true,
-    },
-    syncVendoredPlugins: {
-      type: "boolean",
-      label: "Vendor local-path plugins",
-      description:
-        "Copy plugins installed from a local path: into the preset so other machines install them from vendored files (installed under ~/.bb/preset-vendored).",
+      label: "Sync theme",
+      description: "Theme and favicon color.",
       default: true,
     },
     syncVendoredFiles: {
       type: "boolean",
-      label: "Sync vendored file collections",
+      label: "Sync folders",
       description:
-        "Sync the directories listed below into the preset and materialize them on machines that pull.",
-      default: true,
+        "Copy the folders listed below (for example skills) between machines. Files you edited here are never overwritten without asking.",
+      default: false,
     },
     vendoredPaths: {
       type: "string",
-      label: "Vendored directories",
+      label: "Folders to sync",
       description:
-        "Comma- or newline-separated directories synced as file collections. Only paths inside your home folder are portable (~ expands per machine). Skills, prompts and other agent config live well here.",
-      default: "~/.agents/skills\n~/.claude/skills",
+        "One folder per line inside your home folder, for example ~/.agents/skills. Symbolic links are skipped; folders the Claude app manages (~/.claude/skills/synced) are always left alone.",
+      default: "",
       experimental_multiline: true,
     },
     vendorExcludeGlobs: {
       type: "string",
-      label: "Vendored exclude globs",
+      label: "Skip these files",
       description:
-        "Extra comma-separated glob patterns skipped while vendoring (matched against collection-relative paths). node_modules, .git, VCS metadata, OS noise and credential-like file names are always excluded.",
+        "Patterns skipped in both directions, one per line or comma-separated, for example private/** or *.draft.md. node_modules, .git, OS noise and credential-like files are always skipped.",
       default: "",
       experimental_multiline: true,
     },
     vendorConflictMode: {
       type: "select",
-      label: "File conflict mode",
+      label: "When a file changed on both sides",
       description:
-        "What pull does when a vendored file differs from the local copy: backup copies the local file aside first, overwrite replaces it, skip keeps it.",
-      options: ["backup", "overwrite", "skip"],
-      default: "backup",
+        "skip keeps your version and shows the conflict so you can decide (recommended). backup uses the preset version. Replaced files are always backed up and can be restored.",
+      options: ["skip", "backup", "overwrite"],
+      default: "skip",
+    },
+    syncVendoredPlugins: {
+      type: "boolean",
+      label: "Sync plugins installed from a local folder",
+      description:
+        "Copy their code into the preset so other machines can install them (under ~/.bb/preset-vendored). They run with full access, like every plugin.",
+      default: false,
     },
     vendorPruneExtras: {
       type: "boolean",
-      label: "Prune extra files",
+      label: "Clean up synced plugin copies",
       description:
-        "Remove files inside vendored collection targets that the preset no longer contains. Extras are moved to ~/.bb/preset-vendored/trash, never deleted outright.",
+        "Move files that a vendored plugin no longer ships to ~/.bb/preset-vendored/trash. Your own folders are never pruned.",
       default: false,
     },
     vendorNpmInstall: {
       type: "boolean",
-      label: "Prepare vendored plugins",
+      label: "Install dependencies of synced plugins",
       description:
-        "Run npm ci/install inside a vendored plugin when it ships a package.json but no node_modules, so dependencies resolve after pull.",
+        "Run npm ci or npm install inside a vendored plugin that ships a package.json without node_modules.",
       default: true,
     },
     vendorMaxFileKb: {
       type: "string",
-      label: "Max vendored file size (KB)",
-      description: "Files larger than this are skipped while vendoring.",
+      label: "Largest file to sync (KB)",
+      description: "Larger files are skipped.",
       default: "512",
     },
     vendorMaxCollectionMb: {
       type: "string",
-      label: "Max collection size (MB)",
-      description: "Total bytes per vendored collection before files are skipped.",
+      label: "Largest folder to sync (MB)",
+      description: "Files beyond this total size are skipped.",
       default: "50",
     },
     excludedPlugins: {
       type: "string",
-      label: "Excluded plugins",
+      label: "Plugins to leave alone",
       description:
-        "Comma-separated plugin IDs left unmanaged: never captured, vendored, installed, enabled, disabled, or configured from the preset.",
+        "Comma-separated plugin IDs that Preset Sync never installs, enables, disables, configures or records.",
       default: "",
     },
     excludedSettingKeys: {
       type: "string",
-      label: "Excluded general settings keys",
+      label: "Keep these BB preferences on this machine",
+      description: "Comma-separated preference keys, for example showKeyboardHints.",
+      default: "",
+    },
+    syncedSettingKeys: {
+      type: "string",
+      label: "Also sync these machine settings",
       description:
-        "Comma-separated general settings keys excluded from sync (for example: defaultProviderId, providerOrder).",
+        "Comma-separated keys that normally stay on each machine: providerOrder, defaultProviderId, streamerMode, idleProviderSessionTimeoutMinutes.",
       default: "",
     },
     excludedPluginSettingKeys: {
       type: "string",
-      label: "Excluded plugin settings",
+      label: "Keep these plugin settings on this machine",
+      description: "Comma-separated pluginId.settingKey pairs.",
+      default: "",
+    },
+    syncedPluginSettingKeys: {
+      type: "string",
+      label: "Also sync these plugin paths or commands",
       description:
-        "Comma-separated pluginId.settingKey pairs excluded from plugin settings sync.",
+        "Comma-separated pluginId.settingKey pairs for settings that look machine-specific (keys ending in Command, Path, Dir, Directory, Home) but are the same everywhere.",
       default: "",
     },
   });
@@ -269,11 +343,11 @@ export default async function plugin(bb: BbPluginApi) {
       syncExperiments: value.syncExperiments,
       syncKeybindings: value.syncKeybindings,
       syncAppearance: value.syncAppearance,
-      syncVendoredPlugins: value.syncVendoredPlugins ?? true,
-      syncVendoredFiles: value.syncVendoredFiles ?? true,
+      syncVendoredPlugins: value.syncVendoredPlugins ?? false,
+      syncVendoredFiles: value.syncVendoredFiles ?? false,
       vendoredPaths: value.vendoredPaths ?? "",
       vendorExcludeGlobs: value.vendorExcludeGlobs ?? "",
-      vendorConflictMode: value.vendorConflictMode ?? "backup",
+      vendorConflictMode: value.vendorConflictMode ?? "skip",
       vendorPruneExtras: value.vendorPruneExtras ?? false,
       vendorNpmInstall: value.vendorNpmInstall ?? true,
       vendorMaxFileKb: parsePositiveInt(value.vendorMaxFileKb, 512),
@@ -281,6 +355,8 @@ export default async function plugin(bb: BbPluginApi) {
       excludedPlugins: value.excludedPlugins ?? "",
       excludedSettingKeys: value.excludedSettingKeys ?? "",
       excludedPluginSettingKeys: value.excludedPluginSettingKeys ?? "",
+      syncedSettingKeys: value.syncedSettingKeys ?? "",
+      syncedPluginSettingKeys: value.syncedPluginSettingKeys ?? "",
     };
   });
 
@@ -292,7 +368,18 @@ export default async function plugin(bb: BbPluginApi) {
     sync_preview: () => service.preview(),
     sync_capture: () => service.capture(),
     sync_push: ({ fresh, message }) => service.push({ fresh, message }),
-    sync_pull: () => service.pullAndApply(),
+    sync_pull: ({ fingerprint, selectedChangeIds, resolutions }) =>
+      service.pullAndApply({
+        expectedFingerprint: fingerprint,
+        selectedChangeIds,
+        resolutions,
+      }),
+    sync_restore: () => service.restore(),
+    sync_update_scope: async ({ values }) => {
+      await bb.sdk.plugins.updateSettings({ pluginId: SELF_PLUGIN_ID, values });
+      service.wakeBackgroundCheck();
+      return { ok: true as const };
+    },
   });
 
   bb.background.service("change-check", {
@@ -310,7 +397,7 @@ export default async function plugin(bb: BbPluginApi) {
       },
       {
         name: "diff",
-        summary: "Preview changes that pull would apply",
+        summary: "Preview changes and conflicts that pull would apply",
         usage: "bb preset diff [--json]",
       },
       {
@@ -325,8 +412,13 @@ export default async function plugin(bb: BbPluginApi) {
       },
       {
         name: "pull",
-        summary: "Pull and apply the Git preset after an explicit preview",
-        usage: "bb preset pull --yes [--json]",
+        summary: "Apply the Git preset after an explicit preview",
+        usage: "bb preset pull --yes [--plan <fingerprint>] [--only <id,id>] [--json]",
+      },
+      {
+        name: "restore",
+        summary: "Undo the most recent pull",
+        usage: "bb preset restore --yes [--json]",
       },
     ],
     async run(argv, context) {
@@ -347,6 +439,7 @@ export default async function plugin(bb: BbPluginApi) {
               `Repository: ${status.repository}#${status.branch}`,
               `Remote: ${status.remoteHead.slice(0, 12)} (captured ${status.remoteCapturedAt})`,
               `Pending pull changes: ${status.changeCount}`,
+              `Conflicts: ${status.conflicts.length}`,
               `Pending push changes: ${status.pushChangeCount}`,
               `Checked: ${status.checkedAt}`,
               `Staged capture: ${status.stagedAt ?? "none"}`,
@@ -377,21 +470,21 @@ export default async function plugin(bb: BbPluginApi) {
             return respond(captured, text);
           }
           case "push": {
-            const parsedMessage = parseMessage(argv);
+            const parsedMessage = parseOption(argv, "--message");
             if (!parsedMessage.ok) return { exitCode: 2, stderr: usage };
             const known = new Set([
               "push",
               "--fresh",
               "--json",
               "--message",
-              parsedMessage.message,
+              parsedMessage.value,
             ]);
             if (argv.some((argument) => !known.has(argument))) {
               return { exitCode: 2, stderr: usage };
             }
             const pushed = await service.push({
               fresh: argv.includes("--fresh"),
-              message: parsedMessage.message,
+              message: parsedMessage.value,
               signal: context.signal,
             });
             const text = pushed.pushed
@@ -400,31 +493,56 @@ export default async function plugin(bb: BbPluginApi) {
             return respond(pushed, text);
           }
           case "pull": {
+            const planOption = parseOption(argv, "--plan");
+            const onlyOption = parseOption(argv, "--only");
+            if (!planOption.ok || !onlyOption.ok) return { exitCode: 2, stderr: usage };
             if (!argv.includes("--yes")) {
               const plan = await service.preview(context.signal);
               return {
-                ...respond(
-                  plan,
-                  planText(plan),
-                  plan.changes.length === 0 ? 0 : 2,
-                ),
+                ...respond(plan, planText(plan), plan.changes.length === 0 ? 0 : 2),
                 stderr:
                   plan.changes.length === 0
                     ? undefined
-                    : 'Nothing was changed. Review the preview, then rerun with "bb preset pull --yes".',
+                    : `Nothing was changed. Review the preview, then rerun with "bb preset pull --yes --plan ${plan.fingerprint}".`,
               };
             }
-            const result = await service.pullAndApply(context.signal);
+            const result = await service.pullAndApply({
+              signal: context.signal,
+              expectedFingerprint: planOption.value,
+              selectedChangeIds: onlyOption.value
+                ?.split(",")
+                .map((id) => id.trim())
+                .filter((id) => id !== ""),
+            });
             const text = [
               result.ok
-                ? `Applied ${result.applied.length} changes from GitHub.`
+                ? `Applied ${result.applied.length} changes from the preset.`
                 : `Applied ${result.applied.length} changes with ${result.errors.length} errors.`,
               ...result.applied.map((entry) => `  + ${entry}`),
               ...result.skipped.map((entry) => `  - ${entry}`),
               ...result.errors.map((entry) => `  x ${entry}`),
               ...result.warnings.map((entry) => `  ! ${entry}`),
+              result.backupRun === null
+                ? "Nothing needed a backup."
+                : `Backup: ~/.bb/preset-vendored/backup/${result.backupRun} (undo with "bb preset restore --yes").`,
             ].join("\n");
             return respond(result, text, result.ok ? 0 : 1);
+          }
+          case "restore": {
+            if (!argv.includes("--yes")) {
+              return {
+                exitCode: 2,
+                stderr: 'Restore undoes the most recent pull. Rerun with "bb preset restore --yes".',
+              };
+            }
+            const result = await service.restore();
+            const text = [
+              `Restored ${result.restored.length} items from ${result.run}.`,
+              ...result.restored.map((entry) => `  + ${entry}`),
+              ...result.skipped.map((entry) => `  - ${entry}`),
+              ...result.errors.map((entry) => `  x ${entry}`),
+            ].join("\n");
+            return respond(result, text, result.errors.length === 0 ? 0 : 1);
           }
           default:
             return { exitCode: 2, stderr: usage };
@@ -438,5 +556,5 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.log.info("ready: bb preset status|diff|capture|push|pull");
+  bb.log.info("ready: bb preset status|diff|capture|push|pull|restore");
 }

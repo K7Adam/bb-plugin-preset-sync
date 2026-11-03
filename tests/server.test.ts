@@ -185,6 +185,31 @@ describe("plugin registration", () => {
     await harness.lifecycle.dispose();
   });
 
+  it("lets the page change only what this machine syncs", async () => {
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "preset-sync",
+      sdk: { plugins: { updateSettings: async () => ({}) as never } },
+    });
+    await plugin(bb);
+
+    await harness.behavior.callRpc("sync_update_scope", {
+      values: { syncPlugins: false, vendorConflictMode: "skip" },
+    });
+    expect(harness.inspection.sdk.callsTo("plugins.updateSettings")[0]?.[0]).toEqual({
+      pluginId: "preset-sync",
+      values: { syncPlugins: false, vendorConflictMode: "skip" },
+    });
+    await expect(
+      harness.behavior.callRpc("sync_update_scope", {
+        values: { repositoryUrl: "https://example.test/other.git" },
+      }),
+    ).rejects.toThrow();
+    await expect(harness.behavior.callRpc("sync_update_scope", { values: {} })).rejects.toThrow();
+    expect(harness.inspection.sdk.callsTo("plugins.updateSettings")).toHaveLength(1);
+
+    await harness.lifecycle.dispose();
+  });
+
   it("uses only the public plugin SDK", () => {
     const scan = experimental_scanPublicSdkOnly(process.cwd(), {
       allow: [

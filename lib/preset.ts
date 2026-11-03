@@ -1,6 +1,15 @@
+import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { z } from "zod";
+import { baseEntry, decideMerge, type MergeDecision, type SyncBase } from "./merge";
+import {
+  GENERAL_SETTING_LABELS,
+  isExperimentSynced,
+  isGeneralSettingSynced,
+  isPluginSettingSynced,
+  type OwnershipChoices,
+} from "./ownership";
 import {
   EMPTY_VENDORED_MANIFEST,
   vendoredPluginId,
@@ -156,6 +165,20 @@ export const planChangeSchema = z
     target: z.string(),
     summary: z.string(),
     risk: z.enum(["configuration", "full-trust"]),
+    /** Stable id used to select single changes for a pull. */
+    id: z.string().optional(),
+    /** Extra explanation shown under the summary. */
+    detail: z.string().optional(),
+  })
+  .strict();
+
+/** Something changed both here and in the preset since the last sync. */
+export const planConflictSchema = z
+  .object({
+    id: z.string(),
+    area: z.enum(["files", "general-settings", "experiments", "plugin-settings", "keybindings", "appearance"]),
+    target: z.string(),
+    detail: z.string(),
   })
   .strict();
 
@@ -167,12 +190,16 @@ export const syncPlanSchema = z
     remoteCapturedAt: z.string(),
     localCapturedAt: z.string(),
     changes: z.array(planChangeSchema),
+    conflicts: z.array(planConflictSchema).default([]),
     warnings: z.array(z.string()),
+    /** Hash of exactly this plan; a pull with another fingerprint is refused. */
+    fingerprint: z.string().default(""),
   })
   .strict();
 
 export type SyncPlan = z.infer<typeof syncPlanSchema>;
 export type PlanChange = z.infer<typeof planChangeSchema>;
+export type PlanConflict = z.infer<typeof planConflictSchema>;
 
 export const lastOperationSchema = z
   .object({
@@ -197,6 +224,7 @@ export const syncStatusSchema = z
     pushChangeCount: z.number().int().nonnegative(),
     pullChanges: z.array(planChangeSchema),
     pushChanges: z.array(planChangeSchema),
+    conflicts: z.array(planConflictSchema).default([]),
     warnings: z.array(z.string()),
     lastOperation: lastOperationSchema.nullable(),
   })
@@ -240,9 +268,21 @@ export const applyResultSchema = z
     skipped: z.array(z.string()),
     errors: z.array(z.string()),
     warnings: z.array(z.string()),
+    /** Backup run that `restore` can undo, or null when nothing changed. */
+    backupRun: z.string().nullable().default(null),
   })
   .strict();
 
+export const restoreResultSchema = z
+  .object({
+    run: z.string(),
+    restored: z.array(z.string()),
+    skipped: z.array(z.string()),
+    errors: z.array(z.string()),
+  })
+  .strict();
+
+export type RestoreResult = z.infer<typeof restoreResultSchema>;
 export type SyncStatus = z.infer<typeof syncStatusSchema>;
 export type CachedSyncCheck = z.infer<typeof cachedSyncCheckSchema>;
 export type CaptureResult = z.infer<typeof captureResultSchema>;
@@ -491,8 +531,14 @@ export interface SyncScope {
   syncVendoredPlugins: boolean;
   syncVendoredFiles: boolean;
   excludedPlugins: ReadonlySet<string>;
+  /** General settings this machine keeps local although they sync by default. */
   excludedSettingKeys: ReadonlySet<string>;
+  /** `pluginId.key` pairs this machine keeps local. */
   excludedPluginSettingKeys: ReadonlySet<string>;
+  /** Default-local general settings this machine opts into sync. */
+  syncedSettingKeys?: ReadonlySet<string>;
+  /** Default-local `pluginId.key` pairs this machine opts into sync. */
+  syncedPluginSettingKeys?: ReadonlySet<string>;
 }
 
 export const FULL_SYNC_SCOPE: SyncScope = {
@@ -508,7 +554,35 @@ export const FULL_SYNC_SCOPE: SyncScope = {
   excludedPlugins: new Set(),
   excludedSettingKeys: new Set(),
   excludedPluginSettingKeys: new Set(),
+  syncedSettingKeys: new Set(),
+  syncedPluginSettingKeys: new Set(),
 };
+
+export function generalChoices(scope: SyncScope): OwnershipChoices {
+  return { localKeys: scope.excludedSettingKeys, syncKeys: scope.syncedSettingKeys ?? new Set() };
+}
+
+export function pluginSettingChoices(scope: SyncScope): OwnershipChoices {
+  return {
+    localKeys: scope.excludedPluginSettingKeys,
+    syncKeys: scope.syncedPluginSettingKeys ?? new Set(),
+  };
+}
+
+export function isPluginSettingInScope(
+  scope: SyncScope,
+  entry: { id: string; key: string },
+): boolean {
+  return (
+    scope.syncPluginSettings &&
+    !scope.excludedPlugins.has(entry.id) &&
+    isPluginSettingSynced(entry.id, entry.key, pluginSettingChoices(scope))
+  );
+}
+
+function pickKeys<T>(record: Record<string, T>, keep: (key: string) => boolean): Record<string, T> {
+  return Object.fromEntries(Object.entries(record).filter(([key]) => keep(key)));
+}
 
 export function parseIdListSetting(value: string | undefined): Set<string> {
   if (value === undefined) return new Set();
@@ -530,22 +604,18 @@ export function applySyncScope(
       ? snapshot.plugins.filter((entry) => !scope.excludedPlugins.has(entry.id))
       : [],
     marketplaces: scope.syncMarketplaces ? snapshot.marketplaces : [],
-    pluginSettings: scope.syncPluginSettings
-      ? snapshot.pluginSettings.filter(
-          (entry) =>
-            !scope.excludedPlugins.has(entry.id) &&
-            !scope.excludedPluginSettingKeys.has(`${entry.id}.${entry.key}`),
-        )
-      : [],
+    pluginSettings: snapshot.pluginSettings.filter((entry) =>
+      isPluginSettingInScope(scope, entry),
+    ),
     settings: {
       generalSettings: scope.syncGeneralSettings
-        ? Object.fromEntries(
-            Object.entries(snapshot.settings.generalSettings).filter(
-              ([key]) => !scope.excludedSettingKeys.has(key),
-            ),
+        ? pickKeys(snapshot.settings.generalSettings, (key) =>
+            isGeneralSettingSynced(key, generalChoices(scope)),
           )
         : {},
-      experiments: scope.syncExperiments ? snapshot.settings.experiments : {},
+      experiments: scope.syncExperiments
+        ? pickKeys(snapshot.settings.experiments, isExperimentSynced)
+        : {},
       keybindingOverrides: scope.syncKeybindings
         ? snapshot.settings.keybindingOverrides
         : [],
@@ -564,11 +634,13 @@ export function mergePresetForPush(
   const remotePlugins = remote?.plugins ?? [];
   const remoteSettings = remote?.pluginSettings ?? [];
   const remoteGeneral = remote?.settings.generalSettings ?? {};
-  const preservedGeneralKeys = Object.fromEntries(
-    Object.entries(remoteGeneral).filter(([key]) =>
-      scope.excludedSettingKeys.has(key),
-    ),
+  const remoteExperiments = remote?.settings.experiments ?? {};
+  // Values this machine does not sync stay as other machines published them.
+  const preservedGeneralKeys = pickKeys(
+    remoteGeneral,
+    (key) => !isGeneralSettingSynced(key, generalChoices(scope)),
   );
+  const preservedExperiments = pickKeys(remoteExperiments, (key) => !isExperimentSynced(key));
   return {
     ...local,
     plugins: scope.syncPlugins
@@ -589,10 +661,7 @@ export function mergePresetForPush(
           ...local.pluginSettings,
           ...remoteSettings.filter(
             (entry) =>
-              (scope.excludedPlugins.has(entry.id) ||
-                scope.excludedPluginSettingKeys.has(
-                  `${entry.id}.${entry.key}`,
-                )) &&
+              !isPluginSettingInScope(scope, entry) &&
               !local.pluginSettings.some(
                 (own) => own.id === entry.id && own.key === entry.key,
               ),
@@ -604,8 +673,8 @@ export function mergePresetForPush(
         ? { ...preservedGeneralKeys, ...local.settings.generalSettings }
         : remoteGeneral,
       experiments: scope.syncExperiments
-        ? local.settings.experiments
-        : (remote?.settings.experiments ?? {}),
+        ? { ...preservedExperiments, ...local.settings.experiments }
+        : remoteExperiments,
       keybindingOverrides: scope.syncKeybindings
         ? local.settings.keybindingOverrides
         : (remote?.settings.keybindingOverrides ?? []),
@@ -765,32 +834,179 @@ function plural(count: number, one: string, many: string): string {
   return count === 1 ? one : many;
 }
 
-export function buildPullPlan(args: {
-  repository: string;
-  branch: string;
-  remoteHead: string;
+export interface FolderPlanSummary {
+  collectionId: string;
+  target: string;
+  add: number;
+  update: number;
+  skipped: number;
+  conflictPaths: string[];
+  blocked?: string;
+}
+
+export interface SettingDecision {
+  key: string;
+  decision: MergeDecision;
+  local: unknown;
+  remote: unknown;
+}
+
+export interface PluginSettingDecision extends SettingDecision {
+  pluginId: string;
+}
+
+export interface SettingDecisions {
+  general: SettingDecision[];
+  experiments: SettingDecision[];
+  keybindings: SettingDecision | null;
+  appearance: SettingDecision | null;
+  pluginSettings: PluginSettingDecision[];
+}
+
+function settingDecision(
+  key: string,
+  local: unknown,
+  remote: unknown,
+  base: { value: unknown } | undefined,
+): SettingDecision {
+  return {
+    key,
+    local,
+    remote,
+    decision: decideMerge({ local, remote, base, withoutBase: "take-remote", equal: sameJson }),
+  };
+}
+
+/**
+ * Three-way decisions for every synced setting. Both snapshots must already be
+ * scoped to this machine (applySyncScope), so local-only keys never appear.
+ */
+export function planSettingDecisions(args: {
   local: PresetSnapshot;
   remote: PresetSnapshot;
-  remoteVendored?: VendoredManifest;
-  appliedVendored?: VendorAppliedState;
-  warnings?: string[];
-}): SyncPlan {
-  const { repository, branch, remoteHead } = args;
-  const local = sortSnapshot(args.local);
-  const remote = sortSnapshot(args.remote);
-  const remoteVendored = args.remoteVendored ?? EMPTY_VENDORED_MANIFEST;
-  const appliedVendored = args.appliedVendored ?? { collections: {} };
+  base?: SyncBase;
+  localPluginSettingKeys?: ReadonlyMap<string, ReadonlySet<string>>;
+}): SettingDecisions {
+  const { local, remote, base } = args;
+  const general: SettingDecision[] = [];
+  const remoteGeneral = remote.settings.generalSettings as Record<string, unknown>;
+  const localGeneral = local.settings.generalSettings as Record<string, unknown>;
+  for (const key of Object.keys(remoteGeneral).sort()) {
+    // Legacy alias of showDiagnosticEvents; applied together with it.
+    if (key === "showUnhandledProviderEvents" && "showDiagnosticEvents" in remoteGeneral) continue;
+    const remoteValue = remoteGeneral[key];
+    if (remoteValue === undefined) continue;
+    general.push(
+      settingDecision(key, localGeneral[key], remoteValue, base && baseEntry(base.general, key)),
+    );
+  }
+
+  const experiments: SettingDecision[] = [];
+  for (const [key, remoteValue] of Object.entries(remote.settings.experiments).sort(([a], [b]) =>
+    a.localeCompare(b),
+  )) {
+    if (remoteValue === null) continue;
+    experiments.push(
+      settingDecision(
+        key,
+        local.settings.experiments[key] ?? false,
+        remoteValue,
+        base && baseEntry(base.experiments, key),
+      ),
+    );
+  }
+
+  const keybindings = settingDecision(
+    "keybindingOverrides",
+    local.settings.keybindingOverrides,
+    remote.settings.keybindingOverrides,
+    base?.keybindingOverrides === undefined ? undefined : { value: base.keybindingOverrides },
+  );
+  const appearance = settingDecision(
+    "appearance",
+    local.settings.appearance,
+    remote.settings.appearance,
+    base?.appearance === undefined ? undefined : { value: base.appearance },
+  );
+
+  const localSettingValues = new Map(
+    local.pluginSettings.map((entry) => [`${entry.id}.${entry.key}`, entry.value]),
+  );
+  const pluginSettings: PluginSettingDecision[] = [];
+  for (const entry of remote.pluginSettings) {
+    if (entry.id === SELF_PLUGIN_ID || settingSafetyIssue(entry.key, entry.value) !== null) continue;
+    const knownKeys = args.localPluginSettingKeys?.get(entry.id);
+    if (knownKeys !== undefined && !knownKeys.has(entry.key)) continue;
+    const pair = `${entry.id}.${entry.key}`;
+    pluginSettings.push({
+      pluginId: entry.id,
+      ...settingDecision(
+        entry.key,
+        localSettingValues.get(pair),
+        entry.value,
+        base && baseEntry(base.pluginSettings, pair),
+      ),
+    });
+  }
+
+  return {
+    general,
+    experiments,
+    keybindings: keybindings.decision === "same" ? null : keybindings,
+    appearance: appearance.decision === "same" ? null : appearance,
+    pluginSettings,
+  };
+}
+
+export function describeValue(value: unknown): string {
+  if (value === undefined || value === null) return "not set";
+  if (value === "") return "empty";
+  if (typeof value === "boolean") return value ? "on" : "off";
+  if (Array.isArray(value)) return value.length === 0 ? "none" : value.map(String).join(", ");
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    return entries.length === 0 ? "none" : entries.map(([k, v]) => `${k}: ${String(v)}`).join(", ");
+  }
+  return String(value);
+}
+
+function settingLabel(key: string): string {
+  return GENERAL_SETTING_LABELS[key] ?? key;
+}
+
+export function planFingerprint(plan: {
+  remoteHead: string;
+  changes: PlanChange[];
+  conflicts: PlanConflict[];
+}): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        remoteHead: plan.remoteHead,
+        changes: plan.changes.map((change) => [change.id, change.summary, change.detail ?? ""]),
+        conflicts: plan.conflicts.map((conflict) => [conflict.id, conflict.detail]),
+      }),
+    )
+    .digest("hex")
+    .slice(0, 32);
+}
+
+const FULL_TRUST_DETAIL = "Runs with full access to this machine, like every BB plugin.";
+
+function marketplaceAndPluginChanges(
+  local: PresetSnapshot,
+  remote: PresetSnapshot,
+  remoteVendored: VendoredManifest,
+  appliedVendored: VendorAppliedState,
+  changes: PlanChange[],
+  warnings: string[],
+): void {
   const vendoredPluginCollections = new Map(
     remoteVendored.collections
       .filter((entry) => entry.kind === "plugin" && entry.pluginId !== undefined)
       .map((entry) => [entry.pluginId!, entry]),
   );
-  const changes: PlanChange[] = [];
-  const warnings = [...(args.warnings ?? [])];
-
-  const localMarketplaces = new Map(
-    local.marketplaces.map((entry) => [entry.name, entry]),
-  );
+  const localMarketplaces = new Map(local.marketplaces.map((entry) => [entry.name, entry]));
   for (const marketplace of remote.marketplaces) {
     const current = localMarketplaces.get(marketplace.name);
     if (current === undefined) {
@@ -801,6 +1017,7 @@ export function buildPullPlan(args: {
         continue;
       }
       changes.push({
+        id: `marketplace:${marketplace.name}`,
         kind: "marketplace",
         action: "add",
         target: marketplace.name,
@@ -829,23 +1046,25 @@ export function buildPullPlan(args: {
           continue;
         }
         changes.push({
+          id: `plugin-install:${plugin.id}`,
           kind: "plugin-install",
           action: "install",
           target: plugin.id,
           summary: `Install ${plugin.id} from vendored files (${vendoredCollection.fileCount} files)`,
+          detail: FULL_TRUST_DETAIL,
           risk: "full-trust",
         });
       } else if (!isPortableInstallSource(plugin.install)) {
-        warnings.push(
-          `Plugin ${plugin.id} uses a machine-local source and will be skipped.`,
-        );
+        warnings.push(`Plugin ${plugin.id} uses a machine-local source and will be skipped.`);
         continue;
       } else {
         changes.push({
+          id: `plugin-install:${plugin.id}`,
           kind: "plugin-install",
           action: "install",
           target: plugin.id,
           summary: `Install ${plugin.id} from ${plugin.install}`,
+          detail: FULL_TRUST_DETAIL,
           risk: "full-trust",
         });
       }
@@ -853,10 +1072,10 @@ export function buildPullPlan(args: {
       vendoredPluginId(plugin.install) !== null &&
       current.install === plugin.install &&
       vendoredCollection !== undefined &&
-      appliedVendored.collections[vendoredCollection.id]?.hash !==
-        vendoredCollection.hash
+      appliedVendored.collections[vendoredCollection.id]?.hash !== vendoredCollection.hash
     ) {
       changes.push({
+        id: `vendored:${plugin.id}`,
         kind: "vendored",
         action: "update",
         target: plugin.id,
@@ -870,6 +1089,7 @@ export function buildPullPlan(args: {
     }
     if (current !== undefined && current.enabled !== plugin.enabled) {
       changes.push({
+        id: `plugin-state:${plugin.id}`,
         kind: "plugin-state",
         action: plugin.enabled ? "enable" : "disable",
         target: plugin.id,
@@ -880,91 +1100,217 @@ export function buildPullPlan(args: {
   }
   for (const plugin of local.plugins) {
     if (!remotePluginIds.has(plugin.id) && plugin.id !== SELF_PLUGIN_ID) {
-      warnings.push(
-        `Local plugin ${plugin.id} is not in the preset and will be kept installed.`,
-      );
+      warnings.push(`Local plugin ${plugin.id} is not in the preset and will be kept installed.`);
     }
   }
+}
 
-  for (const collection of remoteVendored.collections) {
-    if (collection.kind !== "files") continue;
-    const applied = appliedVendored.collections[collection.id];
-    if (applied?.hash === collection.hash) continue;
-    changes.push({
-      kind: "vendored",
-      action: applied === undefined ? "add" : "update",
-      target: collection.id,
-      summary: `${applied === undefined ? "Sync" : "Update"} ${collection.fileCount} ${plural(collection.fileCount, "file", "files")} to ${collection.target}`,
-      risk: "configuration",
-    });
+function folderChanges(
+  args: {
+    folders?: FolderPlanSummary[];
+    remoteVendored: VendoredManifest;
+    appliedVendored: VendorAppliedState;
+  },
+  changes: PlanChange[],
+  conflicts: PlanConflict[],
+  warnings: string[],
+): void {
+  if (args.folders === undefined) {
+    // Without a per-file scan only the collection hash can tell what changed.
+    for (const collection of args.remoteVendored.collections) {
+      if (collection.kind !== "files") continue;
+      const applied = args.appliedVendored.collections[collection.id];
+      if (applied?.hash === collection.hash) continue;
+      changes.push({
+        id: `files:${collection.id}`,
+        kind: "vendored",
+        action: applied === undefined ? "add" : "update",
+        target: collection.id,
+        summary: `${applied === undefined ? "Sync" : "Update"} ${collection.fileCount} ${plural(collection.fileCount, "file", "files")} to ${collection.target}`,
+        risk: "configuration",
+      });
+    }
+    return;
   }
+  for (const folder of args.folders) {
+    if (folder.blocked !== undefined) {
+      warnings.push(`Folder ${folder.target} is skipped: ${folder.blocked}.`);
+    }
+    if (folder.add + folder.update > 0) {
+      const parts = [
+        folder.add > 0 ? `${folder.add} new` : null,
+        folder.update > 0 ? `${folder.update} updated` : null,
+      ].filter((part): part is string => part !== null);
+      changes.push({
+        id: `files:${folder.collectionId}`,
+        kind: "vendored",
+        action: folder.update > 0 ? "update" : "add",
+        target: folder.collectionId,
+        summary: `Sync ${folder.target}: ${parts.join(", ")} ${plural(folder.add + folder.update, "file", "files")}`,
+        // RPC results must be plain JSON: omit the key instead of sending undefined.
+        ...(folder.update > 0
+          ? {
+              detail:
+                "Updated files were not edited on this machine since the last sync. Replaced files are backed up for restore.",
+            }
+          : {}),
+        risk: "configuration",
+      });
+    }
+    for (const path of folder.conflictPaths) {
+      conflicts.push({
+        id: `conflict:files:${folder.collectionId}:${path}`,
+        area: "files",
+        target: `${folder.target}/${path}`,
+        detail: "Changed here and in the preset since the last sync. Your version is kept until you choose.",
+      });
+    }
+  }
+}
 
-  const localSettingValues = new Map(
-    local.pluginSettings.map((entry) => [`${entry.id}\u0000${entry.key}`, entry.value]),
-  );
-  const changedSettingsByPlugin = new Map<string, number>();
-  for (const setting of remote.pluginSettings) {
-    if (
-      setting.id === SELF_PLUGIN_ID ||
-      settingSafetyIssue(setting.key, setting.value) !== null
-    ) {
-      continue;
-    }
-    if (!sameJson(localSettingValues.get(`${setting.id}\u0000${setting.key}`), setting.value)) {
-      changedSettingsByPlugin.set(
-        setting.id,
-        (changedSettingsByPlugin.get(setting.id) ?? 0) + 1,
-      );
+function settingChanges(
+  decisions: SettingDecisions,
+  local: PresetSnapshot,
+  remote: PresetSnapshot,
+  changes: PlanChange[],
+  conflicts: PlanConflict[],
+): void {
+  const both = (decision: SettingDecision) =>
+    `This machine: ${describeValue(decision.local)} · Preset: ${describeValue(decision.remote)}`;
+
+  const pluginSettingChanges = new Map<string, string[]>();
+  for (const decision of decisions.pluginSettings) {
+    if (decision.decision === "take-remote") {
+      const lines = pluginSettingChanges.get(decision.pluginId) ?? [];
+      lines.push(`${decision.key}: ${describeValue(decision.local)} → ${describeValue(decision.remote)}`);
+      pluginSettingChanges.set(decision.pluginId, lines);
+    } else if (decision.decision === "conflict") {
+      conflicts.push({
+        id: `conflict:plugin-settings:${decision.pluginId}.${decision.key}`,
+        area: "plugin-settings",
+        target: `${decision.pluginId}: ${decision.key}`,
+        detail: both(decision),
+      });
     }
   }
-  for (const [pluginId, count] of [...changedSettingsByPlugin].sort(([left], [right]) =>
-    left.localeCompare(right),
-  )) {
+  for (const [pluginId, lines] of [...pluginSettingChanges].sort(([a], [b]) => a.localeCompare(b))) {
     changes.push({
+      id: `plugin-settings:${pluginId}`,
       kind: "plugin-settings",
       action: "update",
       target: pluginId,
-      summary: `Update ${count} non-secret ${plural(count, "setting", "settings")} for ${pluginId}`,
+      summary: `Update ${lines.length} non-secret ${plural(lines.length, "setting", "settings")} for ${pluginId}`,
+      detail: lines.join("; "),
       risk: "configuration",
     });
   }
 
-  if (!sameJson(local.settings.generalSettings, remote.settings.generalSettings)) {
-    changes.push({
-      kind: "general-settings",
-      action: "update",
-      target: "BB general settings",
-      summary: "Update BB general settings",
-      risk: "configuration",
-    });
+  for (const decision of decisions.general) {
+    if (decision.decision === "take-remote") {
+      changes.push({
+        id: `general:${decision.key}`,
+        kind: "general-settings",
+        action: "update",
+        target: decision.key,
+        summary: `${settingLabel(decision.key)}: ${describeValue(decision.local)} → ${describeValue(decision.remote)}`,
+        risk: "configuration",
+      });
+    } else if (decision.decision === "conflict") {
+      conflicts.push({
+        id: `conflict:general:${decision.key}`,
+        area: "general-settings",
+        target: settingLabel(decision.key),
+        detail: both(decision),
+      });
+    }
   }
-  if (!sameJson(local.settings.experiments, remote.settings.experiments)) {
-    changes.push({
-      kind: "experiments",
-      action: "update",
-      target: "BB experiments",
-      summary: "Update BB experiment flags",
-      risk: "configuration",
-    });
+  for (const decision of decisions.experiments) {
+    if (decision.decision === "take-remote") {
+      changes.push({
+        id: `experiment:${decision.key}`,
+        kind: "experiments",
+        action: decision.remote === true ? "enable" : "disable",
+        target: decision.key,
+        summary: `Experiment ${decision.key}: ${describeValue(decision.local)} → ${describeValue(decision.remote)}`,
+        risk: "configuration",
+      });
+    } else if (decision.decision === "conflict") {
+      conflicts.push({
+        id: `conflict:experiment:${decision.key}`,
+        area: "experiments",
+        target: `Experiment ${decision.key}`,
+        detail: both(decision),
+      });
+    }
   }
-  if (!sameJson(local.settings.keybindingOverrides, remote.settings.keybindingOverrides)) {
+  if (decisions.keybindings?.decision === "take-remote") {
     changes.push({
+      id: "keybindings",
       kind: "keybindings",
       action: "update",
       target: "Keyboard shortcuts",
       summary: "Replace keyboard shortcut overrides",
       risk: "configuration",
     });
+  } else if (decisions.keybindings?.decision === "conflict") {
+    conflicts.push({
+      id: "conflict:keybindings",
+      area: "keybindings",
+      target: "Keyboard shortcuts",
+      detail: "Shortcut overrides changed here and in the preset since the last sync.",
+    });
   }
-  if (!sameJson(local.settings.appearance, remote.settings.appearance)) {
+  if (decisions.appearance?.decision === "take-remote") {
     changes.push({
+      id: "appearance",
       kind: "appearance",
       action: "update",
       target: "Theme",
       summary: `Switch to theme ${remote.settings.appearance.themeId}`,
       risk: "configuration",
     });
+  } else if (decisions.appearance?.decision === "conflict") {
+    conflicts.push({
+      id: "conflict:appearance",
+      area: "appearance",
+      target: "Theme",
+      detail: `This machine: ${local.settings.appearance.themeId} · Preset: ${remote.settings.appearance.themeId}`,
+    });
   }
+}
+
+export function buildPullPlan(args: {
+  repository: string;
+  branch: string;
+  remoteHead: string;
+  local: PresetSnapshot;
+  remote: PresetSnapshot;
+  remoteVendored?: VendoredManifest;
+  appliedVendored?: VendorAppliedState;
+  warnings?: string[];
+  base?: SyncBase;
+  /** Per-file folder plans; when given they replace the hash-only folder check. */
+  folders?: FolderPlanSummary[];
+  localPluginSettingKeys?: ReadonlyMap<string, ReadonlySet<string>>;
+}): SyncPlan {
+  const { repository, branch, remoteHead } = args;
+  const local = sortSnapshot(args.local);
+  const remote = sortSnapshot(args.remote);
+  const remoteVendored = args.remoteVendored ?? EMPTY_VENDORED_MANIFEST;
+  const appliedVendored = args.appliedVendored ?? { collections: {} };
+  const changes: PlanChange[] = [];
+  const conflicts: PlanConflict[] = [];
+  const warnings = [...(args.warnings ?? [])];
+
+  marketplaceAndPluginChanges(local, remote, remoteVendored, appliedVendored, changes, warnings);
+  folderChanges({ folders: args.folders, remoteVendored, appliedVendored }, changes, conflicts, warnings);
+  const decisions = planSettingDecisions({
+    local,
+    remote,
+    base: args.base,
+    localPluginSettingKeys: args.localPluginSettingKeys,
+  });
+  settingChanges(decisions, local, remote, changes, conflicts);
 
   if (remote.bbVersion !== local.bbVersion) {
     warnings.push(
@@ -979,7 +1325,9 @@ export function buildPullPlan(args: {
     remoteCapturedAt: remote.capturedAt,
     localCapturedAt: local.capturedAt,
     changes,
+    conflicts,
     warnings: [...new Set(warnings)],
+    fingerprint: planFingerprint({ remoteHead, changes, conflicts }),
   });
 }
 

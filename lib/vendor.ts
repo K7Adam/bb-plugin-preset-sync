@@ -7,6 +7,7 @@ import {
   readdir,
   rename,
   rm,
+  rmdir,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -161,7 +162,7 @@ const MAX_TOTAL_BYTES = 256 * 1024 * 1024;
 
 export class VendorError extends Error {}
 
-function sha256Hex(buffer: Buffer): string {
+export function sha256Hex(buffer: Buffer): string {
   return createHash("sha256").update(buffer).digest("hex");
 }
 
@@ -256,6 +257,23 @@ export function isValidVendoredRelPath(relPath: string): boolean {
     if (/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(segment)) return false;
   }
   return true;
+}
+
+/**
+ * Return the first folder between `root` (exclusive) and the file `rel` that
+ * is a symbolic link or junction, or null. Writing through such a folder
+ * would land outside the target even though the path text stays inside it.
+ */
+export async function symlinkedParent(root: string, rel: string): Promise<string | null> {
+  const segments = rel.split("/");
+  let current = resolve(root);
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    current = join(current, segments[index]!);
+    const entry = await lstat(current).catch(() => null);
+    if (entry === null) return null;
+    if (entry.isSymbolicLink()) return segments.slice(0, index + 1).join("/");
+  }
+  return null;
 }
 
 /** Resolve `rel` inside `root`, refusing any escape. Returns the absolute path. */
@@ -540,6 +558,11 @@ export async function materializeVendoredFiles(args: {
     const source = resolveWithin(sourceDir, entry.path);
     const target = resolveWithin(targetDir, entry.path);
     try {
+      const linkedFolder = await symlinkedParent(targetDir, entry.path);
+      if (linkedFolder !== null) {
+        out.skipped.push(`${entry.path} (folder ${linkedFolder} is a symbolic link)`);
+        continue;
+      }
       const sourceStat = await lstat(source);
       if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
         out.skipped.push(`${entry.path} (not a regular file in the preset)`);
@@ -643,7 +666,8 @@ async function removeEmptyDirs(
     const absolute = join(dir, entry.name);
     await removeEmptyDirs(absolute, preserve);
     const remaining = await readdir(absolute).catch(() => ["?"]);
-    if (remaining.length === 0) await rm(absolute, { force: true });
+    // rmdir only ever removes an empty directory, so a race cannot delete content.
+    if (remaining.length === 0) await rmdir(absolute).catch(() => undefined);
   }
 }
 
@@ -740,8 +764,22 @@ export async function exportVendoredToRepo(args: {
 export interface VendorAppliedState {
   collections: Record<
     string,
-    { hash: string; appliedAt: string; target?: string }
+    {
+      hash: string;
+      appliedAt: string;
+      target?: string;
+      /** Last synchronized sha256 per collection-relative path (three-way base). */
+      files?: Record<string, string>;
+    }
   >;
+}
+
+export async function writeVendorState(state: VendorAppliedState): Promise<void> {
+  const file = vendoredStateFile();
+  await mkdir(dirname(file), { recursive: true });
+  const temporary = `${file}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  await rename(temporary, file);
 }
 
 export async function readVendorState(): Promise<VendorAppliedState> {
@@ -760,19 +798,20 @@ export async function readVendorState(): Promise<VendorAppliedState> {
 
 export async function recordVendorApplied(
   collectionId: string,
-  record: { hash: string; target?: string },
+  record: { hash: string; target?: string; files?: Record<string, string> },
 ): Promise<void> {
   const state = await readVendorState();
-  state.collections[collectionId] = {
-    hash: record.hash,
-    appliedAt: new Date().toISOString(),
-    target: record.target,
-  };
-  const file = vendoredStateFile();
-  await mkdir(dirname(file), { recursive: true });
-  const temporary = `${file}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-  await rename(temporary, file);
+  await writeVendorState({
+    collections: {
+      ...state.collections,
+      [collectionId]: {
+        hash: record.hash,
+        appliedAt: new Date().toISOString(),
+        target: record.target,
+        files: record.files ?? state.collections[collectionId]?.files,
+      },
+    },
+  });
 }
 
 export async function readVendoredManifest(repoDir: string): Promise<VendoredManifest> {

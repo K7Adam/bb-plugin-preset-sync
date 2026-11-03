@@ -1,23 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { definePluginApp, useRealtime, useRpc, useSettings } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
-import type {
-  ApplyResult,
-  CachedSyncCheck,
-  CaptureResult,
-  PlanChange,
-  PushResult,
-  SyncPlan,
-  SyncStatus,
-} from "./lib/preset";
+import type { ApplyResult, CachedSyncCheck, RestoreResult, SyncPlan, SyncStatus } from "./lib/preset";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import {
   Dialog,
   DialogClose,
@@ -27,89 +12,65 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Icon } from "@/components/ui/icon";
+import {
+  Notice,
+  PublishPanel,
+  PullResult,
+  RestoreSummary,
+  ReviewPanel,
+  ScopePanel,
+  SetupGuide,
+  StatusSummary,
+  type ConflictChoice,
+} from "./components/preset-sync/panels";
+import { plural } from "./components/preset-sync/scope-model";
 
-type PendingAction = "pull" | "push" | "fresh-push" | null;
+type Pending =
+  | { kind: "pull"; selection: string[]; resolutions: Record<string, ConflictChoice> }
+  | { kind: "publish" }
+  | { kind: "undo" }
+  | null;
 
-function shortSha(value: string): string {
-  return value.slice(0, 12);
+const STALE_PLAN = "changed since the preview";
+
+function errorText(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
 }
 
-function readableDate(value: string | null | undefined): string {
-  if (value === null || value === undefined) return "—";
-  if (value === "unknown") return "legacy snapshot";
-  const date = new Date(value);
-  return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
-}
-
-function StatusBadge({
-  status,
-  configured,
-}: {
-  status: SyncStatus | null;
-  configured: boolean;
-}) {
-  if (!configured) {
-    return <span className="text-xs text-muted-foreground">Setup required</span>;
+function confirmationText(pending: Exclude<Pending, null>, plan: SyncPlan | null) {
+  if (pending.kind === "publish") {
+    return {
+      title: "Publish this machine to the preset?",
+      description:
+        "The preset files in the configured branch are committed and pushed. Other machines see the changes on their next check.",
+      action: "Publish",
+    };
   }
-  if (status === null) {
-    return <span className="text-xs text-muted-foreground">Not checked</span>;
+  if (pending.kind === "undo") {
+    return {
+      title: "Undo the last pull?",
+      description:
+        "Replaced files and settings go back to how they were. Anything you changed after the pull is left alone. Installed plugins stay installed.",
+      action: "Undo pull",
+    };
   }
-  const clean = status.changeCount === 0;
-  const pushClean = status.pushChangeCount === 0;
-  const labels = [
-    status.changeCount > 0 ? `↓${status.changeCount}` : null,
-    status.pushChangeCount > 0 ? `↑${status.pushChangeCount}` : null,
-  ].filter((label): label is string => label !== null);
-  return (
-    <span
-      className={
-        clean && pushClean
-          ? "rounded-full bg-secondary px-2.5 py-1 text-xs font-medium text-secondary-foreground"
-          : "rounded-full bg-muted px-2.5 py-1 text-xs font-medium text-foreground"
-      }
-    >
-      {clean && pushClean ? "In sync" : labels.join(" ")}
-    </span>
-  );
-}
-
-function ChangeList({
-  changes,
-  empty,
-}: {
-  changes: PlanChange[];
-  empty: string;
-}) {
-  if (changes.length === 0) {
-    return <p className="text-sm text-muted-foreground">{empty}</p>;
-  }
-  return (
-    <ul className="space-y-1.5 text-sm">
-      {changes.map((change, index) => (
-        <li key={`${change.kind}-${change.target}-${index}`} className="flex gap-2">
-          <span
-            className={
-              change.risk === "full-trust"
-                ? "text-destructive"
-                : "text-muted-foreground"
-            }
-          >
-            {change.risk === "full-trust" ? "!" : "•"}
-          </span>
-          <span>{change.summary}</span>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function ResultNotice({ children }: { children: string }) {
-  return (
-    <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-foreground">
-      {children}
-    </div>
-  );
+  const fullAccess =
+    plan?.changes.filter(
+      (change) => change.risk === "full-trust" && pending.selection.includes(change.id ?? ""),
+    ).length ?? 0;
+  const decisions = Object.keys(pending.resolutions).length;
+  return {
+    title: `Apply ${plural(pending.selection.length, "change", "changes")}${decisions > 0 ? ` and ${plural(decisions, "decision", "decisions")}` : ""}?`,
+    description: [
+      fullAccess > 0
+        ? `${plural(fullAccess, "plugin gets", "plugins get")} installed with full access to this machine.`
+        : null,
+      "Everything replaced is backed up and the pull can be undone.",
+    ]
+      .filter(Boolean)
+      .join(" "),
+    action: "Apply",
+  };
 }
 
 function PresetSyncSettings() {
@@ -120,368 +81,165 @@ function PresetSyncSettings() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [pendingAction, setPendingAction] = useState<PendingAction>(null);
+  const [pullResult, setPullResult] = useState<ApplyResult | null>(null);
+  const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
+  const [pending, setPending] = useState<Pending>(null);
 
-  const repository =
-    typeof pluginSettings.values?.repositoryUrl === "string"
-      ? pluginSettings.values.repositoryUrl.trim()
-      : "";
+  const values = pluginSettings.values;
+  const repository = typeof values?.repositoryUrl === "string" ? values.repositoryUrl.trim() : "";
   const configured = repository !== "";
-  const branch =
-    typeof pluginSettings.values?.branch === "string"
-      ? pluginSettings.values.branch
-      : "main";
-
-  const reportError = useCallback((cause: unknown) => {
-    setError(cause instanceof Error ? cause.message : String(cause));
-  }, []);
+  const branch = typeof values?.branch === "string" ? values.branch : "main";
 
   const refreshStatus = useCallback(async () => {
     if (!configured) {
       setStatus(null);
       setPlan(null);
-      setError(null);
       return;
     }
     setBusy("status");
     try {
-      const next = await rpc.call("sync_status");
-      setStatus(next);
+      setStatus(await rpc.call("sync_status"));
       setError(null);
     } catch (cause) {
-      reportError(cause);
+      setError(errorText(cause));
     } finally {
       setBusy(null);
     }
-  }, [configured, reportError, rpc]);
+  }, [configured, rpc]);
 
   const loadCachedStatus = useCallback(async () => {
     if (!configured) return;
     try {
       const check: CachedSyncCheck | null = await rpc.call("sync_cached_check");
       if (check !== null) {
-        if (check.status !== null && check.status.repository === repository) {
-          setStatus(check.status);
-        }
+        if (check.status !== null && check.status.repository === repository) setStatus(check.status);
         setError(check.error);
       }
     } catch (cause) {
-      reportError(cause);
+      setError(errorText(cause));
     }
-  }, [configured, reportError, repository, rpc]);
+  }, [configured, repository, rpc]);
 
   useEffect(() => {
     void refreshStatus();
   }, [refreshStatus, repository, branch]);
-  useRealtime("preset-sync-changed", () => {
-    void refreshStatus();
-  });
-  useRealtime("preset-sync-state", () => {
-    void loadCachedStatus();
-  });
+  useRealtime("preset-sync-changed", () => void refreshStatus());
+  useRealtime("preset-sync-state", () => void loadCachedStatus());
 
-  const preview = async (): Promise<SyncPlan | null> => {
+  const openReview = async () => {
     setBusy("preview");
+    setPullResult(null);
+    setRestoreResult(null);
     try {
-      const next = await rpc.call("sync_preview");
-      setPlan(next);
+      setPlan(await rpc.call("sync_preview"));
       setError(null);
-      setNotice(
-        next.changes.length === 0
-          ? "This machine already matches the Git preset."
-          : `Previewed ${next.changes.length} changes; nothing has been applied.`,
-      );
-      return next;
     } catch (cause) {
-      reportError(cause);
-      return null;
+      setError(errorText(cause));
     } finally {
       setBusy(null);
     }
   };
 
-  const capture = async () => {
-    setBusy("capture");
+  const updateScope = async (next: Record<string, string | boolean>) => {
+    setBusy("scope");
     try {
-      const result: CaptureResult = await rpc.call("sync_capture");
-      setNotice(
-        `Staged ${result.pluginCount} plugins and ${result.pluginSettingCount} non-secret plugin settings.` +
-          (result.vendoredCount > 0
-            ? ` Vendored ${result.vendoredCount} collections (${result.vendoredFileCount} files).`
-            : ""),
-      );
+      await rpc.call("sync_update_scope", { values: next });
+      setPlan(null);
       setError(null);
-      await refreshStatus();
     } catch (cause) {
-      reportError(cause);
+      setError(errorText(cause));
     } finally {
       setBusy(null);
     }
   };
 
-  const openPullConfirmation = async () => {
-    const nextPlan = plan ?? (await preview());
-    if (nextPlan !== null && nextPlan.changes.length > 0) setPendingAction("pull");
-  };
-
-  const confirmAction = async () => {
-    const action = pendingAction;
-    setPendingAction(null);
+  const confirm = async () => {
+    const action = pending;
+    setPending(null);
     if (action === null) return;
-    setBusy(action);
+    setBusy(action.kind);
     try {
-      if (action === "pull") {
-        const result: ApplyResult = await rpc.call("sync_pull", { confirmed: true });
-        setNotice(
-          result.ok
-            ? `Applied ${result.applied.length} changes from GitHub.`
-            : `Applied ${result.applied.length} changes with ${result.errors.length} errors.`,
-        );
-        setError(result.errors.length === 0 ? null : result.errors.join(" · "));
-        setPlan(null);
-      } else {
-        const result: PushResult = await rpc.call("sync_push", {
-          fresh: action === "fresh-push",
+      if (action.kind === "pull") {
+        const result = await rpc.call("sync_pull", {
+          confirmed: true,
+          fingerprint: plan?.fingerprint || undefined,
+          selectedChangeIds: action.selection,
+          resolutions: action.resolutions,
         });
+        setPullResult(result);
+        setPlan(null);
+        setError(null);
+      } else if (action.kind === "undo") {
+        setRestoreResult(await rpc.call("sync_restore", { confirmed: true }));
+        setPullResult(null);
+        setError(null);
+      } else {
+        const result = await rpc.call("sync_push", { fresh: true });
         setNotice(
           result.pushed
-            ? `Pushed ${result.changedFiles.length} files at ${shortSha(result.head)}.`
-            : `Git preset is already current at ${shortSha(result.head)}.`,
+            ? `Published ${plural(result.changedFiles.length, "file", "files")} to the preset.`
+            : "The preset already matched this machine.",
         );
         setError(null);
       }
       await refreshStatus();
     } catch (cause) {
-      reportError(cause);
+      const message = errorText(cause);
+      setError(message);
+      // The preset moved on: show the fresh plan instead of applying a stale one.
+      if (action.kind === "pull" && message.includes(STALE_PLAN)) await openReview();
     } finally {
       setBusy(null);
     }
   };
 
   const disabled = busy !== null;
-  const confirmationTitle =
-    pendingAction === "pull"
-      ? "Apply preset to this BB installation?"
-      : pendingAction === "push"
-        ? "Push the staged preset to GitHub?"
-        : "Capture this machine and push to GitHub?";
-  const confirmationDescription =
-    pendingAction === "pull"
-      ? "This can install full-trust plugins and update BB settings. Local plugins absent from the preset will remain installed."
-      : "The managed preset JSON files in the configured branch will be committed and pushed. Other repository files are preserved.";
+  const hasPullWork = (status?.changeCount ?? 0) > 0 || (status?.conflicts.length ?? 0) > 0;
+  const dialog = pending === null ? null : confirmationText(pending, plan);
 
   return (
     <div className="space-y-4">
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Icon name="Github" className="size-4" />
-                Git preset
-              </CardTitle>
-              <CardDescription className="mt-1 break-all">
-                {configured ? `${repository} · ${branch}` : "Repository not configured"}
-              </CardDescription>
-            </div>
-            <StatusBadge status={status} configured={configured} />
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="grid gap-2 text-sm sm:grid-cols-4">
-            <div>
-              <div className="text-xs text-muted-foreground">Remote commit</div>
-              <div className="font-mono">{status ? shortSha(status.remoteHead) : "—"}</div>
-            </div>
-            <div>
-              <div className="text-xs text-muted-foreground">Remote capture</div>
-              <div>{readableDate(status?.remoteCapturedAt)}</div>
-            </div>
-            <div>
-              <div className="text-xs text-muted-foreground">Local stage</div>
-              <div>{readableDate(status?.stagedAt)}</div>
-            </div>
-            <div>
-              <div className="text-xs text-muted-foreground">Last checked</div>
-              <div>{readableDate(status?.checkedAt)}</div>
-            </div>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" size="sm" disabled={disabled || !configured} onClick={refreshStatus}>
-              <Icon name={busy === "status" ? "Spinner" : "ArrowReloadHorizontal"} />
-              Check
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
-
-      {status !== null &&
-      (status.pullChanges.length > 0 || status.pushChanges.length > 0) ? (
-        <Card>
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base">Available sync</CardTitle>
-            <CardDescription>
-              Choose the direction after reviewing exactly what will change.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-4 md:grid-cols-2">
-            <section className="space-y-3 rounded-md border border-border p-3">
-              <div>
-                <div className="flex items-center justify-between gap-2 font-medium">
-                  <span>Pull to this BB</span>
-                  <span className="text-xs text-muted-foreground">
-                    ↓ {status.pullChanges.length}
-                  </span>
-                </div>
-                <p className="text-xs text-muted-foreground">Remote → this machine</p>
-              </div>
-              <ChangeList
-                changes={status.pullChanges}
-                empty="No remote changes to apply."
-              />
-              <Button
-                size="sm"
-                disabled={disabled || status.pullChanges.length === 0}
-                onClick={() => void openPullConfirmation()}
-              >
-                <Icon name="ArrowDown" />
-                Pull remote
+      {!configured ? <SetupGuide /> : (
+        <>
+          <StatusSummary repository={repository} branch={branch} status={status} busy={busy === "status"} onCheck={() => void refreshStatus()} />
+          {plan === null ? (
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" disabled={disabled} variant={hasPullWork ? "default" : "outline"} onClick={() => void openReview()}>
+                Review updates
               </Button>
-            </section>
-            <section className="space-y-3 rounded-md border border-border p-3">
-              <div>
-                <div className="flex items-center justify-between gap-2 font-medium">
-                  <span>Push this BB</span>
-                  <span className="text-xs text-muted-foreground">
-                    ↑ {status.pushChanges.length}
-                  </span>
-                </div>
-                <p className="text-xs text-muted-foreground">This machine → remote</p>
-              </div>
-              <ChangeList
-                changes={status.pushChanges}
-                empty="No local changes to publish."
-              />
-              <Button
-                size="sm"
-                disabled={disabled || status.pushChanges.length === 0}
-                onClick={() => setPendingAction("fresh-push")}
-              >
-                <Icon name="ArrowUp" />
-                Push local
-              </Button>
-            </section>
-          </CardContent>
-        </Card>
+            </div>
+          ) : (
+            <ReviewPanel
+              plan={plan}
+              busy={disabled}
+              onClose={() => setPlan(null)}
+              onApply={(selection, resolutions) => setPending({ kind: "pull", selection, resolutions })}
+            />
+          )}
+        </>
+      )}
+      {notice === null ? null : <Notice>{notice}</Notice>}
+      {error === null ? null : <Notice tone="error">{error}</Notice>}
+      {pullResult === null ? null : (
+        <PullResult result={pullResult} busy={disabled} onUndo={() => setPending({ kind: "undo" })} />
+      )}
+      {restoreResult === null ? null : <RestoreSummary result={restoreResult} />}
+      <ScopePanel values={values} disabled={disabled} onUpdate={updateScope} />
+      {configured ? (
+        <PublishPanel status={status} busy={disabled} onPublish={() => setPending({ kind: "publish" })} />
       ) : null}
 
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">Publish this machine</CardTitle>
-          <CardDescription>
-            Capture only portable configuration. Credentials, provider sessions, history, and
-            secret plugin settings are excluded.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-wrap gap-2">
-          <Button variant="outline" size="sm" disabled={disabled} onClick={() => void capture()}>
-            <Icon name="FolderExport" />
-            Stage current
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={disabled || !configured || status?.stagedAt == null}
-            onClick={() => setPendingAction("push")}
-          >
-            <Icon name="ArrowUp" />
-            Push staged
-          </Button>
-          <Button size="sm" disabled={disabled || !configured} onClick={() => setPendingAction("fresh-push")}>
-            <Icon name="Cloud" />
-            Capture & push
-          </Button>
-        </CardContent>
-      </Card>
-
-      {!configured ? (
-        <ResultNotice>
-          Set Preset repository in Settings → Plugins → Preset Sync, then return here to sync.
-        </ResultNotice>
-      ) : null}
-      {notice === null ? null : <ResultNotice>{notice}</ResultNotice>}
-      {error === null ? null : (
-        <div role="alert" className="rounded-md border border-destructive/50 px-3 py-2 text-sm text-destructive">
-          {error}
-        </div>
-      )}
-
-      {plan === null ? null : (
-        <Card>
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base">Pull preview</CardTitle>
-            <CardDescription>
-              {plan.changes.length} pending changes from {shortSha(plan.remoteHead)}. No changes
-              have been applied.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {plan.changes.length === 0 ? (
-              <p className="text-sm text-muted-foreground">Everything is already in sync.</p>
-            ) : (
-              <ul className="space-y-1.5 text-sm">
-                {plan.changes.map((change, index) => (
-                  <li key={`${change.kind}-${change.target}-${index}`} className="flex gap-2">
-                    <span className={change.risk === "full-trust" ? "text-destructive" : "text-muted-foreground"}>
-                      {change.risk === "full-trust" ? "!" : "+"}
-                    </span>
-                    <span>{change.summary}</span>
-                  </li>
-                ))}
-              </ul>
-            )}
-            {plan.warnings.length === 0 ? null : (
-              <div className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
-                {plan.warnings.map((warning) => (
-                  <div key={warning}>• {warning}</div>
-                ))}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      )}
-
-      <Dialog open={pendingAction !== null} onOpenChange={(open) => !open && setPendingAction(null)}>
+      <Dialog open={pending !== null} onOpenChange={(open) => !open && setPending(null)}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{confirmationTitle}</DialogTitle>
-            <DialogDescription>{confirmationDescription}</DialogDescription>
+            <DialogTitle>{dialog?.title}</DialogTitle>
+            <DialogDescription>{dialog?.description}</DialogDescription>
           </DialogHeader>
-          {pendingAction === "pull" && plan !== null ? (
-            <div className="max-h-56 overflow-y-auto rounded-md border border-border p-3 text-sm">
-              {plan.changes.map((change, index) => (
-                <div key={`${change.kind}-${change.target}-${index}`} className="py-1">
-                  {change.risk === "full-trust" ? "! " : "+ "}
-                  {change.summary}
-                </div>
-              ))}
-            </div>
-          ) : null}
-          {pendingAction === "fresh-push" && status !== null ? (
-            <div className="max-h-56 overflow-y-auto rounded-md border border-border p-3">
-              <ChangeList
-                changes={status.pushChanges}
-                empty="No local changes to publish."
-              />
-            </div>
-          ) : null}
           <DialogFooter>
             <DialogClose asChild>
               <Button variant="outline">Cancel</Button>
             </DialogClose>
-            <Button onClick={() => void confirmAction()}>
-              {pendingAction === "pull" ? "Apply changes" : "Commit & push"}
-            </Button>
+            <Button onClick={() => void confirm()}>{dialog?.action}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -492,7 +250,7 @@ function PresetSyncSettings() {
 function PresetSyncPage() {
   return (
     <div className="h-full overflow-y-auto">
-      <div className="mx-auto max-w-4xl p-4 md:p-6">
+      <div className="mx-auto max-w-3xl p-4 md:p-6">
         <PresetSyncSettings />
       </div>
     </div>
@@ -519,9 +277,7 @@ function PresetSyncSidebarAccessory() {
   useEffect(() => {
     void load();
   }, [load]);
-  useRealtime("preset-sync-state", () => {
-    void load();
-  });
+  useRealtime("preset-sync-state", () => void load());
 
   if (repository === "" || check === null) return null;
   if (check.error !== null) {
@@ -536,28 +292,31 @@ function PresetSyncSidebarAccessory() {
     );
   }
   const status = check.status;
+  const conflicts = status?.conflicts.length ?? 0;
   if (
     status === null ||
     status.repository !== repository ||
-    (status.changeCount === 0 && status.pushChangeCount === 0)
+    (status.changeCount === 0 && status.pushChangeCount === 0 && conflicts === 0)
   ) {
     return null;
   }
   const label = [
     status.changeCount > 0 ? `↓${status.changeCount}` : null,
     status.pushChangeCount > 0 ? `↑${status.pushChangeCount}` : null,
+    conflicts > 0 ? `≠${conflicts}` : null,
   ]
     .filter((part): part is string => part !== null)
     .join(" ");
   const details = [
     ...status.pullChanges.map((change) => `↓ ${change.summary}`),
     ...status.pushChanges.map((change) => `↑ ${change.summary}`),
+    ...status.conflicts.map((conflict) => `≠ ${conflict.target}`),
   ].join("\n");
   return (
     <span
-      className="inline-flex max-w-16 items-center whitespace-nowrap text-[11px] font-semibold text-foreground"
+      className="inline-flex max-w-20 items-center whitespace-nowrap text-[11px] font-semibold text-foreground"
       title={details}
-      aria-label={`${status.changeCount} remote and ${status.pushChangeCount} local preset changes`}
+      aria-label={`${status.changeCount} remote and ${status.pushChangeCount} local preset changes, ${conflicts} conflicts`}
     >
       {label}
     </span>
@@ -568,7 +327,7 @@ export default definePluginApp((app) => {
   app.slots.settingsSection({
     id: "preset-sync",
     title: "Preset Sync",
-    description: "Synchronize portable BB configuration through a Git repository.",
+    description: "Keep plugins, preferences and chosen folders the same on all your computers.",
     component: PresetSyncSettings,
   });
   app.slots.navPanel({

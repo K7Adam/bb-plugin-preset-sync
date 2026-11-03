@@ -1,5 +1,17 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { execFile } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
+import { countFolder, planFolder, type FolderPlan } from "./folder-sync";
+import { pushRemotePreset, readRemotePreset } from "./git";
+import { PullJournal } from "./journal";
+import { EMPTY_SYNC_BASE, syncBaseSchema, type SyncBase } from "./merge";
+import { appManagedExcludes } from "./ownership";
 import {
+  applyResultSchema,
+  applySyncScope,
   buildPullPlan,
   buildPushChanges,
   cachedSyncCheckSchema,
@@ -8,52 +20,50 @@ import {
   isPortableMarketplaceSource,
   isSensitiveSettingKey,
   lastOperationSchema,
-  parseCatalogInstallSource,
+  mergePresetForPush,
+  parseIdListSetting,
   presetSnapshotSchema,
   sameJson,
   settingSafetyIssue,
+  syncScopeWarnings,
   SELF_PLUGIN_ID,
-  type LastOperation,
+  type ApplyResult,
   type CachedSyncCheck,
+  type LastOperation,
   type PluginSettingPresetEntry,
   type PresetSnapshot,
+  type RestoreResult,
   type SyncPlan,
-  applySyncScope,
-  mergePresetForPush,
-  parseIdListSetting,
-  syncScopeWarnings,
   type SyncScope,
 } from "./preset";
-import { pushRemotePreset, readRemotePreset } from "./git";
 import {
-  VENDORED_PLUGIN_PRESERVE_NAMES,
+  pluginInstallSpec,
+  pluginPathSource,
+  settingValueMatchesDescriptor,
+  type InstalledPlugin,
+} from "./plugins-api";
+import { applyPull, type ConflictChoice } from "./pull";
+import { restoreLastPull } from "./restore";
+import {
   VendorError,
   collectionIdForPath,
   expandHome,
   isValidVendoredId,
-  isValidVendoredRepoDir,
-  materializeVendoredFiles,
   parseGlobList,
-  prepareVendoredPlugin,
   readVendorState,
   recordVendorApplied,
   toHomeRelative,
-  vendorConflictMode,
-  vendoredBackupRoot,
   vendoredInstallSource,
   vendoredPluginDir,
   vendoredPluginId,
-  vendoredTrashRoot,
   walkVendoredSource,
+  writeVendorState,
+  type VendorAppliedState,
   type VendoredCollection,
   type VendoredManifest,
 } from "./vendor";
-import { lstat } from "node:fs/promises";
-import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { promisify } from "node:util";
+
+export { installPluginFromPreset } from "./plugins-api";
 
 const execFileAsync = promisify(execFile);
 
@@ -83,6 +93,20 @@ export interface SyncSettings {
   excludedPlugins: string;
   excludedSettingKeys: string;
   excludedPluginSettingKeys: string;
+  /** Default-local general settings this machine syncs anyway. */
+  syncedSettingKeys?: string;
+  /** Default-local `pluginId.key` pairs this machine syncs anyway. */
+  syncedPluginSettingKeys?: string;
+}
+
+export interface PullOptions {
+  signal?: AbortSignal;
+  /** Fingerprint of the previewed plan; a different current plan is refused. */
+  expectedFingerprint?: string;
+  /** Change ids to apply; all planned changes when omitted. */
+  selectedChangeIds?: readonly string[];
+  /** Conflict id -> choice. */
+  resolutions?: Readonly<Record<string, ConflictChoice>>;
 }
 
 function scopeFromSettings(settings: SyncSettings): SyncScope {
@@ -98,9 +122,9 @@ function scopeFromSettings(settings: SyncSettings): SyncScope {
     syncVendoredFiles: settings.syncVendoredFiles,
     excludedPlugins: parseIdListSetting(settings.excludedPlugins),
     excludedSettingKeys: parseIdListSetting(settings.excludedSettingKeys),
-    excludedPluginSettingKeys: parseIdListSetting(
-      settings.excludedPluginSettingKeys,
-    ),
+    excludedPluginSettingKeys: parseIdListSetting(settings.excludedPluginSettingKeys),
+    syncedSettingKeys: parseIdListSetting(settings.syncedSettingKeys),
+    syncedPluginSettingKeys: parseIdListSetting(settings.syncedPluginSettingKeys),
   };
 }
 
@@ -111,9 +135,11 @@ interface CapturedPreset {
   vendored: VendoredCollection[];
   /** Absolute source directory for each collection id this machine captured. */
   vendoredSourceDirs: Map<string, string>;
+  /** Setting keys each installed plugin declares on this machine. */
+  pluginSettingKeys: Map<string, Set<string>>;
 }
 
-interface StagedPreset extends CapturedPreset {
+interface StagedPreset extends Omit<CapturedPreset, "pluginSettingKeys"> {
   stagedAt: string;
 }
 
@@ -125,30 +151,27 @@ interface StagedPresetStored {
   vendoredSourceDirs?: unknown;
 }
 
+type RemotePreset = Awaited<ReturnType<typeof readRemotePreset>>;
+
+interface Gathered {
+  settings: SyncSettings;
+  scope: SyncScope;
+  remote: RemotePreset;
+  remoteScoped: RemotePreset;
+  local: CapturedPreset;
+  applied: VendorAppliedState;
+  base: SyncBase;
+  folders: FolderPlan[];
+  plan: SyncPlan;
+}
+
 const STAGED_KEY = "staged-preset-v1";
 const LAST_OPERATION_KEY = "last-operation-v1";
 const CACHED_CHECK_KEY = "cached-check-v1";
+const SYNC_BASE_KEY = "sync-base-v1";
 const MAX_STAGED_BYTES = 240 * 1024;
 const DEFAULT_BACKGROUND_INTERVAL_MS = 5 * 60 * 1_000;
 const ALLOWED_BACKGROUND_INTERVALS = new Set([1, 5, 10, 15, 30, 60]);
-
-type SystemConfig = Awaited<ReturnType<BbPluginApi["sdk"]["system"]["config"]>>;
-
-function pluginInstallSpec(plugin: Awaited<ReturnType<BbPluginApi["sdk"]["plugins"]["list"]>>["plugins"][number]): string {
-  if (plugin.source.startsWith("builtin:")) return plugin.source;
-  if (plugin.catalogEntryId !== undefined && plugin.catalogMarketplaceName !== undefined) {
-    return `${plugin.catalogEntryId}@${plugin.catalogMarketplaceName}`;
-  }
-  return plugin.source;
-}
-
-function pluginPathSource(
-  plugin: Awaited<
-    ReturnType<BbPluginApi["sdk"]["plugins"]["list"]>
-  >["plugins"][number],
-): string | null {
-  return plugin.source.startsWith("path:") ? plugin.source.slice(5) : null;
-}
 
 /** Keep vendored collections that are inside this machine's sync scope. */
 export function applyVendoredScope(
@@ -203,61 +226,6 @@ export function mergeVendoredForPush(args: {
   return merged;
 }
 
-export async function installPluginFromPreset(
-  bb: BbPluginApi,
-  source: string,
-  signal?: AbortSignal,
-): Promise<unknown> {
-  const catalogTarget = parseCatalogInstallSource(source);
-  if (catalogTarget === null) {
-    return bb.sdk.plugins.install({ source });
-  }
-
-  const plan = await bb.sdk.plugins.catalog.installPlan({
-    ...catalogTarget,
-    signal,
-  });
-  if (!plan.compatible) {
-    throw new Error(
-      plan.incompatibleReason ?? `Catalog plugin ${catalogTarget.entryId} is incompatible`,
-    );
-  }
-
-  if (plan.kind === "marketplace") {
-    const unresolvedReason = plan.resolvedSource.unresolvedReason;
-    if (unresolvedReason !== undefined) {
-      throw new Error(unresolvedReason);
-    }
-    return bb.sdk.plugins.catalog.install({
-      ...catalogTarget,
-      confirmedSource: plan.resolvedSource,
-    });
-  }
-
-  return bb.sdk.plugins.catalog.install(catalogTarget);
-}
-
-function settingValueMatchesDescriptor(
-  descriptor: { type: string; options?: string[] },
-  value: string | boolean | number,
-): boolean {
-  if (descriptor.type === "boolean") return typeof value === "boolean";
-  if (descriptor.type === "number") {
-    return typeof value === "number" && Number.isFinite(value);
-  }
-  if (typeof value !== "string") {
-    // Number values stored against string descriptors (CLI-set overrides)
-    // round-trip as JSON, which is safe to sync.
-    return (
-      typeof value === "number" &&
-      Number.isFinite(value) &&
-      (descriptor.type === "string" || descriptor.type === "project")
-    );
-  }
-  if (descriptor.type === "select") return descriptor.options?.includes(value) ?? false;
-  return descriptor.type === "string" || descriptor.type === "project";
-}
-
 function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
@@ -287,9 +255,14 @@ function cachedCheckFingerprint(check: CachedSyncCheck | null): unknown {
       pushChangeCount: status.pushChangeCount,
       pullChanges: status.pullChanges,
       pushChanges: status.pushChanges,
+      conflicts: status.conflicts,
       warnings: status.warnings,
     },
   };
+}
+
+function folderBaseFiles(collection: VendoredCollection): Record<string, string> {
+  return Object.fromEntries(collection.entries.map((entry) => [entry.path, entry.sha256]));
 }
 
 export class PresetSyncService {
@@ -340,6 +313,16 @@ export class PresetSyncService {
     return parsed.success ? parsed.data : null;
   }
 
+  private async readBase(): Promise<SyncBase> {
+    const value = await this.bb.storage.kv.get<unknown>(SYNC_BASE_KEY);
+    const parsed = syncBaseSchema.safeParse(value);
+    return parsed.success ? parsed.data : structuredClone(EMPTY_SYNC_BASE);
+  }
+
+  private async writeBase(base: SyncBase): Promise<void> {
+    await this.bb.storage.kv.set(SYNC_BASE_KEY, base);
+  }
+
   async cachedCheck(): Promise<CachedSyncCheck | null> {
     const value = await this.bb.storage.kv.get<unknown>(CACHED_CHECK_KEY);
     if (value === undefined) return null;
@@ -356,6 +339,7 @@ export class PresetSyncService {
         hasError: check.error !== null,
         pullCount: check.status?.changeCount ?? 0,
         pushCount: check.status?.pushChangeCount ?? 0,
+        conflictCount: check.status?.conflicts.length ?? 0,
       });
     }
   }
@@ -380,6 +364,167 @@ export class PresetSyncService {
     };
   }
 
+  private async captureLocalPlugin(
+    plugin: InstalledPlugin,
+    scope: SyncScope,
+    limits: { maxFileBytes: number; maxBytes: number; excludeGlobs: string[] },
+    out: {
+      plugins: { id: string; install: string; enabled: boolean }[];
+      vendored: VendoredCollection[];
+      vendoredSourceDirs: Map<string, string>;
+      warnings: string[];
+    },
+  ): Promise<void> {
+    const install = pluginInstallSpec(plugin);
+    const pathSource = pluginPathSource(plugin);
+
+    // A plugin installed from Preset Sync's managed vendored directory is a
+    // pull artifact, not a local source: normalize its install spec so the
+    // source comparison stays symmetric, but never re-vendor it.
+    if (pathSource !== null && resolve(pathSource) === resolve(vendoredPluginDir(plugin.id))) {
+      out.plugins.push({ id: plugin.id, install: vendoredInstallSource(plugin.id), enabled: plugin.enabled });
+      return;
+    }
+    if (isPortableInstallSource(install)) {
+      out.plugins.push({ id: plugin.id, install, enabled: plugin.enabled });
+      return;
+    }
+    if (
+      pathSource === null ||
+      !scope.syncVendoredPlugins ||
+      scope.excludedPlugins.has(plugin.id) ||
+      !isValidVendoredId(plugin.id)
+    ) {
+      out.warnings.push(`Skipped local-path plugin ${plugin.id}.`);
+      return;
+    }
+    try {
+      const walk = await walkVendoredSource(pathSource, limits);
+      if (walk.entries.length === 0) {
+        out.warnings.push(`Skipped local-path plugin ${plugin.id}: no vendorable files.`);
+        return;
+      }
+      for (const skip of walk.skipped) {
+        out.warnings.push(`Vendored plugin ${plugin.id}: skipped ${skip.path} (${skip.reason}).`);
+      }
+      out.vendored.push({
+        id: plugin.id,
+        kind: "plugin",
+        pluginId: plugin.id,
+        repoDir: `vendored/plugins/${plugin.id}`,
+        hash: walk.hash,
+        fileCount: walk.entries.length,
+        bytes: walk.bytes,
+        entries: walk.entries,
+      });
+      out.vendoredSourceDirs.set(plugin.id, resolve(pathSource));
+      out.plugins.push({ id: plugin.id, install: vendoredInstallSource(plugin.id), enabled: plugin.enabled });
+    } catch (cause) {
+      out.warnings.push(`Skipped local-path plugin ${plugin.id}: ${errorMessage(cause)}`);
+    }
+  }
+
+  private async captureFolders(
+    settings: SyncSettings,
+    limits: { maxFileBytes: number; maxBytes: number; excludeGlobs: string[] },
+    out: {
+      vendored: VendoredCollection[];
+      vendoredSourceDirs: Map<string, string>;
+      warnings: string[];
+    },
+  ): Promise<void> {
+    const collectionIds = new Set(out.vendored.map((entry) => entry.id));
+    for (const configured of parseIdListSetting(settings.vendoredPaths)) {
+      const absolute = expandHome(configured);
+      const homeRelative = toHomeRelative(absolute);
+      if (homeRelative === null || homeRelative === "~") {
+        out.warnings.push(
+          `Skipped vendored path ${configured}: only directories inside your home folder are portable.`,
+        );
+        continue;
+      }
+      try {
+        const walk = await walkVendoredSource(absolute, {
+          ...limits,
+          excludeGlobs: [...limits.excludeGlobs, ...appManagedExcludes(homeRelative)],
+        });
+        if (walk.entries.length === 0) {
+          out.warnings.push(`Skipped vendored path ${configured}: no vendorable files.`);
+          continue;
+        }
+        for (const skip of walk.skipped) {
+          if (skip.reason === "excluded by glob") continue;
+          out.warnings.push(`Vendored ${homeRelative}: skipped ${skip.path} (${skip.reason}).`);
+        }
+        let id = collectionIdForPath(homeRelative);
+        for (let suffix = 2; collectionIds.has(id); suffix += 1) {
+          id = `${collectionIdForPath(homeRelative)}-${suffix}`;
+        }
+        collectionIds.add(id);
+        out.vendored.push({
+          id,
+          kind: "files",
+          repoDir: `vendored/files/${id}`,
+          target: homeRelative,
+          hash: walk.hash,
+          fileCount: walk.entries.length,
+          bytes: walk.bytes,
+          entries: walk.entries,
+        });
+        out.vendoredSourceDirs.set(id, absolute);
+      } catch (cause) {
+        if (cause instanceof VendorError && cause.message.includes("does not exist")) {
+          continue; // Optional paths like ~/.claude/skills may not exist.
+        }
+        out.warnings.push(`Skipped vendored path ${configured}: ${errorMessage(cause)}`);
+      }
+    }
+  }
+
+  private async capturePluginSettings(
+    plugins: InstalledPlugin[],
+    signal: AbortSignal | undefined,
+    warnings: string[],
+  ): Promise<{ entries: PluginSettingPresetEntry[]; keys: Map<string, Set<string>> }> {
+    const keys = new Map<string, Set<string>>();
+    const captured = await Promise.all(
+      plugins
+        .filter((plugin) => plugin.id !== SELF_PLUGIN_ID && plugin.hasSettings)
+        .map(async (plugin) => {
+          try {
+            const response = await this.bb.sdk.plugins.getSettings({ pluginId: plugin.id, signal });
+            keys.set(plugin.id, new Set(Object.keys(response.schema)));
+            return Object.entries(response.schema).flatMap(([key, descriptor]) => {
+              const value = response.values[key];
+              const syncable =
+                typeof value === "string" ||
+                typeof value === "boolean" ||
+                (typeof value === "number" && Number.isFinite(value));
+              const secret = "secret" in descriptor && descriptor.secret === true;
+              const safetyIssue =
+                typeof value === "string" || typeof value === "boolean"
+                  ? settingSafetyIssue(key, value)
+                  : null;
+              if (secret || isSensitiveSettingKey(key) || safetyIssue !== null) {
+                if (safetyIssue !== null && !secret) {
+                  warnings.push(`Skipped ${plugin.id}.${key}: ${safetyIssue}.`);
+                }
+                return [];
+              }
+              if (!syncable || !settingValueMatchesDescriptor(descriptor, value as string | boolean | number)) {
+                return [];
+              }
+              return [{ id: plugin.id, key, value: value as string | boolean | number }];
+            });
+          } catch (cause) {
+            warnings.push(`Could not read non-secret settings for ${plugin.id}: ${errorMessage(cause)}`);
+            return [];
+          }
+        }),
+    );
+    return { entries: captured.flat(), keys };
+  }
+
   private async captureSnapshot(signal?: AbortSignal): Promise<CapturedPreset> {
     const [config, pluginList, marketplaces, version] = await Promise.all([
       this.bb.sdk.system.config({ signal }),
@@ -389,207 +534,35 @@ export class PresetSyncService {
     ]);
     const settings = await this.getSettings();
     const scope = scopeFromSettings(settings);
-    const warnings: string[] = [];
-
-    const vendored: VendoredCollection[] = [];
-    const vendoredSourceDirs = new Map<string, string>();
-    const excludeGlobs = parseGlobList(settings.vendorExcludeGlobs);
-    const maxFileBytes = Math.max(1, settings.vendorMaxFileKb) * 1024;
-    const maxBytes = Math.max(1, settings.vendorMaxCollectionMb) * 1024 * 1024;
-
-    const plugins: { id: string; install: string; enabled: boolean }[] = [];
+    const limits = {
+      maxFileBytes: Math.max(1, settings.vendorMaxFileKb) * 1024,
+      maxBytes: Math.max(1, settings.vendorMaxCollectionMb) * 1024 * 1024,
+      excludeGlobs: parseGlobList(settings.vendorExcludeGlobs),
+    };
+    const collected = {
+      plugins: [] as { id: string; install: string; enabled: boolean }[],
+      vendored: [] as VendoredCollection[],
+      vendoredSourceDirs: new Map<string, string>(),
+      warnings: [] as string[],
+    };
     for (const plugin of pluginList.plugins) {
       if (plugin.id === SELF_PLUGIN_ID) continue;
-      const install = pluginInstallSpec(plugin);
-      const pathSource = pluginPathSource(plugin);
-
-      // A plugin installed from Preset Sync's managed vendored directory is a
-      // pull artifact, not a local source: normalize its install spec so the
-      // source comparison stays symmetric, but never re-vendor it.
-      if (
-        pathSource !== null &&
-        resolve(pathSource) === resolve(vendoredPluginDir(plugin.id))
-      ) {
-        plugins.push({
-          id: plugin.id,
-          install: vendoredInstallSource(plugin.id),
-          enabled: plugin.enabled,
-        });
-        continue;
-      }
-
-      if (isPortableInstallSource(install)) {
-        plugins.push({ id: plugin.id, install, enabled: plugin.enabled });
-        continue;
-      }
-
-      if (
-        pathSource !== null &&
-        scope.syncVendoredPlugins &&
-        !scope.excludedPlugins.has(plugin.id) &&
-        isValidVendoredId(plugin.id)
-      ) {
-        try {
-          const walk = await walkVendoredSource(pathSource, {
-            maxFileBytes,
-            maxBytes,
-            excludeGlobs,
-          });
-          if (walk.entries.length === 0) {
-            warnings.push(
-              `Skipped local-path plugin ${plugin.id}: no vendorable files.`,
-            );
-            continue;
-          }
-          for (const skip of walk.skipped) {
-            warnings.push(
-              `Vendored plugin ${plugin.id}: skipped ${skip.path} (${skip.reason}).`,
-            );
-          }
-          vendored.push({
-            id: plugin.id,
-            kind: "plugin",
-            pluginId: plugin.id,
-            repoDir: `vendored/plugins/${plugin.id}`,
-            hash: walk.hash,
-            fileCount: walk.entries.length,
-            bytes: walk.bytes,
-            entries: walk.entries,
-          });
-          vendoredSourceDirs.set(plugin.id, resolve(pathSource));
-          plugins.push({
-            id: plugin.id,
-            install: vendoredInstallSource(plugin.id),
-            enabled: plugin.enabled,
-          });
-          continue;
-        } catch (cause) {
-          warnings.push(
-            `Skipped local-path plugin ${plugin.id}: ${errorMessage(cause)}`,
-          );
-          continue;
-        }
-      }
-
-      warnings.push(`Skipped local-path plugin ${plugin.id}.`);
+      await this.captureLocalPlugin(plugin, scope, limits, collected);
     }
-
-    if (scope.syncVendoredFiles) {
-      const collectionIds = new Set(vendored.map((entry) => entry.id));
-      for (const configured of parseIdListSetting(settings.vendoredPaths)) {
-        const absolute = expandHome(configured);
-        const homeRelative = toHomeRelative(absolute);
-        if (homeRelative === null || homeRelative === "~") {
-          warnings.push(
-            `Skipped vendored path ${configured}: only directories inside your home folder are portable.`,
-          );
-          continue;
-        }
-        try {
-          const walk = await walkVendoredSource(absolute, {
-            maxFileBytes,
-            maxBytes,
-            excludeGlobs,
-          });
-          if (walk.entries.length === 0) {
-            warnings.push(
-              `Skipped vendored path ${configured}: no vendorable files.`,
-            );
-            continue;
-          }
-          for (const skip of walk.skipped) {
-            warnings.push(
-              `Vendored ${homeRelative}: skipped ${skip.path} (${skip.reason}).`,
-            );
-          }
-          let id = collectionIdForPath(homeRelative);
-          for (let suffix = 2; collectionIds.has(id); suffix += 1) {
-            id = `${collectionIdForPath(homeRelative)}-${suffix}`;
-          }
-          collectionIds.add(id);
-          vendored.push({
-            id,
-            kind: "files",
-            repoDir: `vendored/files/${id}`,
-            target: homeRelative,
-            hash: walk.hash,
-            fileCount: walk.entries.length,
-            bytes: walk.bytes,
-            entries: walk.entries,
-          });
-          vendoredSourceDirs.set(id, absolute);
-        } catch (cause) {
-          if (
-            cause instanceof VendorError &&
-            cause.message.includes("does not exist")
-          ) {
-            continue; // Optional paths like ~/.claude/skills may not exist.
-          }
-          warnings.push(
-            `Skipped vendored path ${configured}: ${errorMessage(cause)}`,
-          );
-        }
-      }
-    }
+    if (scope.syncVendoredFiles) await this.captureFolders(settings, limits, collected);
 
     const portableMarketplaces = marketplaces.flatMap((marketplace) => {
       if (marketplace.official) return [];
       if (!isPortableMarketplaceSource(marketplace.source)) {
-        warnings.push(`Skipped local-path marketplace ${marketplace.name}.`);
+        collected.warnings.push(`Skipped local-path marketplace ${marketplace.name}.`);
         return [];
       }
       return [{ name: marketplace.name, source: marketplace.source }];
     });
 
-    const pluginSettings: PluginSettingPresetEntry[] = [];
-    if (settings.includePluginSettings) {
-      const captured = await Promise.all(
-        pluginList.plugins
-          .filter((plugin) => plugin.id !== SELF_PLUGIN_ID && plugin.hasSettings)
-          .map(async (plugin) => {
-            try {
-              const response = await this.bb.sdk.plugins.getSettings({
-                pluginId: plugin.id,
-                signal,
-              });
-              return Object.entries(response.schema).flatMap(([key, descriptor]) => {
-                const value = response.values[key];
-                const syncable =
-                  typeof value === "string" ||
-                  typeof value === "boolean" ||
-                  (typeof value === "number" && Number.isFinite(value));
-                const safetyIssue =
-                  typeof value === "string" || typeof value === "boolean"
-                    ? settingSafetyIssue(key, value)
-                    : null;
-                if (
-                  ("secret" in descriptor && descriptor.secret === true) ||
-                  isSensitiveSettingKey(key) ||
-                  safetyIssue !== null
-                ) {
-                  if (
-                    safetyIssue !== null &&
-                    !("secret" in descriptor && descriptor.secret === true)
-                  ) {
-                    warnings.push(
-                      `Skipped ${plugin.id}.${key}: ${safetyIssue}.`,
-                    );
-                  }
-                  return [];
-                }
-                if (!syncable || !settingValueMatchesDescriptor(descriptor, value as string | boolean | number)) return [];
-                return [{ id: plugin.id, key, value: value as string | boolean | number }];
-              });
-            } catch (cause) {
-              warnings.push(
-                `Could not read non-secret settings for ${plugin.id}: ${errorMessage(cause)}`,
-              );
-              return [];
-            }
-          }),
-      );
-      pluginSettings.push(...captured.flat());
-    }
+    const pluginSettings = settings.includePluginSettings
+      ? await this.capturePluginSettings(pluginList.plugins, signal, collected.warnings)
+      : { entries: [], keys: new Map<string, Set<string>>() };
 
     const snapshot = presetSnapshotSchema.parse({
       schemaVersion: 1,
@@ -604,127 +577,132 @@ export class PresetSyncService {
           faviconColor: config.appearance.faviconColor,
         },
       },
-      plugins,
+      plugins: collected.plugins,
       marketplaces: portableMarketplaces,
-      pluginSettings,
+      pluginSettings: pluginSettings.entries,
     });
-    warnings.push(...syncScopeWarnings(scope, null, snapshot));
+    collected.warnings.push(...syncScopeWarnings(scope, null, snapshot));
     return {
       snapshot: applySyncScope(snapshot, scope),
-      vendored,
-      vendoredSourceDirs,
-      warnings: unique(warnings),
+      vendored: collected.vendored,
+      vendoredSourceDirs: collected.vendoredSourceDirs,
+      pluginSettingKeys: pluginSettings.keys,
+      warnings: unique(collected.warnings),
     };
   }
 
-  private async remoteAndLocal(signal?: AbortSignal): Promise<{
-    remote: Awaited<ReturnType<typeof readRemotePreset>>;
-    remoteScoped: Awaited<ReturnType<typeof readRemotePreset>>;
-    local: CapturedPreset;
-    appliedVendored: Awaited<ReturnType<typeof readVendorState>>;
-    scope: SyncScope;
-    settings: SyncSettings;
-  }> {
+  /** Resolve a preset-declared "~/..." collection target inside the home dir. */
+  private resolveVendoredTarget(target: string | undefined): string | null {
+    if (target === undefined || target === "~" || !target.startsWith("~/")) {
+      return null;
+    }
+    const resolved = expandHome(target);
+    return toHomeRelative(resolved) === target ? resolved : null;
+  }
+
+  /** Read the preset once, compare it with this machine and build the plan. */
+  private async gather(signal?: AbortSignal, copyVendoredTo?: string): Promise<Gathered> {
     const settings = await this.remoteSettings();
-    const [remote, local, appliedVendored] = await Promise.all([
+    const scope = scopeFromSettings(settings);
+    const [remote, local, applied, base] = await Promise.all([
       readRemotePreset({
         repositoryUrl: settings.repositoryUrl,
         branch: settings.branch,
         githubToken: settings.githubToken,
+        copyVendoredTo,
         signal,
       }),
       this.captureSnapshot(signal),
       readVendorState(),
+      this.readBase(),
     ]);
-    const scope = scopeFromSettings(settings);
-    return {
-      remote,
-      remoteScoped: {
-        ...remote,
-        snapshot: applySyncScope(remote.snapshot, scope),
-        vendored: {
-          schemaVersion: 1,
-          collections: applyVendoredScope(remote.vendored.collections, scope),
-        },
+    const remoteScoped: RemotePreset = {
+      ...remote,
+      snapshot: applySyncScope(remote.snapshot, scope),
+      vendored: {
+        schemaVersion: 1,
+        collections: applyVendoredScope(remote.vendored.collections, scope),
       },
-      local: {
-        ...local,
-        warnings: [
-          ...local.warnings,
-          ...(remote.vendoredWarning !== undefined
-            ? [remote.vendoredWarning]
-            : []),
-          ...syncScopeWarnings(scope, remote.snapshot, local.snapshot),
-        ],
-      },
-      appliedVendored,
-      scope,
-      settings,
     };
-  }
+    const warnings = [
+      ...local.warnings,
+      ...(remote.vendoredWarning !== undefined ? [remote.vendoredWarning] : []),
+      ...syncScopeWarnings(scope, remote.snapshot, local.snapshot),
+    ];
 
-  private pullPlan(args: {
-    remoteScoped: Awaited<ReturnType<typeof readRemotePreset>>;
-    local: CapturedPreset;
-    appliedVendored: Awaited<ReturnType<typeof readVendorState>>;
-    settings: SyncSettings;
-  }): SyncPlan {
-    const { remoteScoped, local, appliedVendored, settings } = args;
-    return buildPullPlan({
+    const localExcludes = parseGlobList(settings.vendorExcludeGlobs);
+    const folders: FolderPlan[] = [];
+    for (const collection of remoteScoped.vendored.collections) {
+      if (collection.kind !== "files") continue;
+      const targetDir = this.resolveVendoredTarget(collection.target);
+      if (targetDir === null || !isValidVendoredId(collection.id)) {
+        warnings.push(`Folder ${collection.target ?? collection.id} has an unsafe target and is skipped.`);
+        continue;
+      }
+      folders.push(
+        await planFolder({
+          collection,
+          target: collection.target!,
+          targetDir,
+          excludeGlobs: [...localExcludes, ...appManagedExcludes(collection.target)],
+          baseFiles: applied.collections[collection.id]?.files,
+        }),
+      );
+    }
+
+    const plan = buildPullPlan({
       repository: settings.repositoryUrl,
       branch: settings.branch,
-      remoteHead: remoteScoped.head,
+      remoteHead: remote.head,
       local: local.snapshot,
       remote: remoteScoped.snapshot,
       remoteVendored: remoteScoped.vendored,
-      appliedVendored,
-      warnings: local.warnings,
+      appliedVendored: applied,
+      warnings,
+      base,
+      folders: folders.map((folder) => {
+        const counts = countFolder(folder);
+        return {
+          collectionId: folder.collection.id,
+          target: folder.target,
+          add: counts.add,
+          update: counts.update,
+          skipped: counts.skip,
+          conflictPaths: folder.decisions
+            .filter((decision) => decision.action === "conflict")
+            .map((decision) => decision.path),
+          blocked: folder.blocked,
+        };
+      }),
+      localPluginSettingKeys: local.pluginSettingKeys,
     });
+    return { settings, scope, remote, remoteScoped, local, applied, base, folders, plan };
   }
 
   async preview(signal?: AbortSignal): Promise<SyncPlan> {
-    return this.exclusive(async () => {
-      const { remoteScoped, local, appliedVendored, settings } =
-        await this.remoteAndLocal(signal);
-      return this.pullPlan({ remoteScoped, local, appliedVendored, settings });
-    });
+    return this.exclusive(async () => (await this.gather(signal)).plan);
   }
 
   async status(signal?: AbortSignal) {
     return this.exclusive(async () => {
-      const { remote, remoteScoped, local, appliedVendored, scope, settings } =
-        await this.remoteAndLocal(signal);
-      const plan = this.pullPlan({
-        remoteScoped,
-        local,
-        appliedVendored,
-        settings,
-      });
+      const { remote, local, scope, settings, plan } = await this.gather(signal);
       const [staged, lastOperation] = await Promise.all([
         this.readStaged(),
         this.readLastOperation(),
       ]);
-      const mergedPlugins = mergePresetForPush(
-        local.snapshot,
-        remote.snapshot,
-        scope,
-      ).plugins;
-      const pushChanges = buildPushChanges(
-        mergePresetForPush(local.snapshot, remote.snapshot, scope),
-        remote.snapshot,
-        {
-          local: {
-            schemaVersion: 1,
-            collections: mergeVendoredForPush({
-              local: applyVendoredScope(local.vendored, scope),
-              remote: remote.vendored,
-              mergedPlugins,
-              scope,
-            }),
-          },
-          remote: remote.vendored,
+      const merged = mergePresetForPush(local.snapshot, remote.snapshot, scope);
+      const pushChanges = buildPushChanges(merged, remote.snapshot, {
+        local: {
+          schemaVersion: 1,
+          collections: mergeVendoredForPush({
+            local: applyVendoredScope(local.vendored, scope),
+            remote: remote.vendored,
+            mergedPlugins: merged.plugins,
+            scope,
+          }),
         },
-      );
+        remote: remote.vendored,
+      });
       const checkedAt = new Date().toISOString();
       const status = {
         checkedAt,
@@ -738,6 +716,7 @@ export class PresetSyncService {
         pushChangeCount: pushChanges.length,
         pullChanges: plan.changes,
         pushChanges,
+        conflicts: plan.conflicts,
         warnings: plan.warnings,
         lastOperation,
       };
@@ -862,9 +841,9 @@ export class PresetSyncService {
   }
 
   /**
-   * Rebuild full vendored collections (entries + hashes) for a push. Fresh
-   * captures reuse their walk results; staged collections re-walk their live
-   * source so the preset always publishes the current on-disk state.
+   * Rebuild full vendored collections (entries + hashes) for a push. Staged
+   * collections re-walk their live source so the preset always publishes the
+   * current on-disk state.
    */
   private async rebuildVendoredForPush(
     staged: StagedPreset,
@@ -883,10 +862,7 @@ export class PresetSyncService {
     const maxFileBytes = Math.max(1, settings.vendorMaxFileKb) * 1024;
     const maxBytes = Math.max(1, settings.vendorMaxCollectionMb) * 1024 * 1024;
 
-    let pluginById: Map<
-      string,
-      Awaited<ReturnType<BbPluginApi["sdk"]["plugins"]["list"]>>["plugins"][number]
-    > | null = null;
+    let pluginById: Map<string, InstalledPlugin> | null = null;
 
     for (const collection of applyVendoredScope(staged.vendored, scope)) {
       const knownSource = staged.vendoredSourceDirs.get(collection.id);
@@ -923,7 +899,7 @@ export class PresetSyncService {
         const walk = await walkVendoredSource(sourceDir, {
           maxFileBytes,
           maxBytes,
-          excludeGlobs,
+          excludeGlobs: [...excludeGlobs, ...appManagedExcludes(collection.target)],
         });
         collections.push({
           ...collection,
@@ -934,6 +910,7 @@ export class PresetSyncService {
         });
         sourceDirs.set(collection.id, sourceDir);
         for (const skip of walk.skipped) {
+          if (skip.reason === "excluded by glob") continue;
           warnings.push(`Vendored ${collection.id}: skipped ${skip.path} (${skip.reason}).`);
         }
       } catch (cause) {
@@ -943,6 +920,36 @@ export class PresetSyncService {
       }
     }
     return { collections, sourceDirs, warnings };
+  }
+
+  /** After a push both sides agree: record the published values as the base. */
+  private async recordPushedBase(
+    snapshot: PresetSnapshot,
+    scope: SyncScope,
+    pushedFolders: VendoredCollection[],
+  ): Promise<void> {
+    const base = await this.readBase();
+    const next: SyncBase = {
+      ...base,
+      general: { ...base.general, ...snapshot.settings.generalSettings },
+      experiments: { ...base.experiments, ...snapshot.settings.experiments },
+      pluginSettings: {
+        ...base.pluginSettings,
+        ...Object.fromEntries(
+          snapshot.pluginSettings.map((entry) => [`${entry.id}.${entry.key}`, entry.value]),
+        ),
+      },
+    };
+    if (scope.syncKeybindings) next.keybindingOverrides = snapshot.settings.keybindingOverrides;
+    if (scope.syncAppearance) next.appearance = snapshot.settings.appearance;
+    await this.writeBase(next);
+    for (const collection of pushedFolders) {
+      await recordVendorApplied(collection.id, {
+        hash: collection.hash,
+        target: collection.target,
+        files: folderBaseFiles(collection),
+      }).catch(() => undefined);
+    }
   }
 
   async push(args: { fresh: boolean; message?: string; signal?: AbortSignal }) {
@@ -1004,19 +1011,14 @@ export class PresetSyncService {
           sourceDirs: rebuilt.sourceDirs,
         },
       );
-      // File collections just pushed were read from their own target dirs —
-      // record them as applied so pull plans do not flag this machine.
-      const pushedIds = new Set(
-        mergedVendored.map((collection) => collection.id),
+      const pushedIds = new Set(mergedVendored.map((collection) => collection.id));
+      await this.recordPushedBase(
+        staged.snapshot,
+        scope,
+        rebuilt.collections.filter(
+          (collection) => collection.kind === "files" && pushedIds.has(collection.id),
+        ),
       );
-      for (const collection of rebuilt.collections) {
-        if (collection.kind !== "files" || !pushedIds.has(collection.id)) {
-          continue;
-        }
-        await recordVendorApplied(collection.id, {
-          hash: collection.hash,
-        }).catch(() => undefined);
-      }
       const at = new Date().toISOString();
       await this.writeLastOperation({
         type: "push",
@@ -1068,392 +1070,88 @@ export class PresetSyncService {
     }
   }
 
-  /** Resolve a preset-declared "~/..." collection target inside the home dir. */
-  private resolveVendoredTarget(target: string | undefined): string | null {
-    if (target === undefined || target === "~" || !target.startsWith("~/")) {
-      return null;
-    }
-    const resolved = expandHome(target);
-    return toHomeRelative(resolved) === target ? resolved : null;
+  /**
+   * Apply the preset. The plan is rebuilt from a single clone that also
+   * supplies the file payloads; with `expectedFingerprint` the pull is refused
+   * when that plan differs from the one the user previewed.
+   */
+  async pullAndApply(options: PullOptions = {}): Promise<ApplyResult> {
+    return this.exclusive(async () => {
+      const payloadRoot = await mkdtemp(join(tmpdir(), "bb-preset-pull-"));
+      try {
+        const gathered = await this.gather(options.signal, payloadRoot);
+        const { plan, settings } = gathered;
+        if (
+          options.expectedFingerprint !== undefined &&
+          options.expectedFingerprint !== plan.fingerprint
+        ) {
+          throw new Error(
+            "The preset or this machine changed since the preview. Nothing was applied; review the new preview.",
+          );
+        }
+        const journal = new PullJournal(gathered.base, gathered.applied.collections);
+        const outcome = await applyPull({
+          bb: this.bb,
+          remote: gathered.remoteScoped,
+          local: gathered.local.snapshot,
+          localPluginSettingKeys: gathered.local.pluginSettingKeys,
+          applied: gathered.applied,
+          base: gathered.base,
+          folders: gathered.folders,
+          payloadRoot,
+          selection:
+            options.selectedChangeIds === undefined
+              ? undefined
+              : new Set(options.selectedChangeIds),
+          resolutions: options.resolutions ?? {},
+          defaultFileConflict: settings.vendorConflictMode === "skip" ? undefined : "take-remote",
+          npmInstall: settings.vendorNpmInstall,
+          journal,
+          runProcess: (command, args, cwd) => this.runProcess(command, args, cwd),
+          signal: options.signal,
+        });
+        await this.writeBase(outcome.base);
+        await writeVendorState({ collections: outcome.folderState });
+        const saved = await journal.save();
+
+        const ok = outcome.errors.length === 0;
+        await this.writeLastOperation({
+          type: "pull",
+          at: new Date().toISOString(),
+          summary: ok
+            ? `Applied ${outcome.applied.length} changes from the preset`
+            : `Applied ${outcome.applied.length} changes with ${outcome.errors.length} errors`,
+        });
+        return applyResultSchema.parse({
+          ok,
+          plan,
+          applied: outcome.applied,
+          skipped: outcome.skipped,
+          errors: outcome.errors,
+          warnings: unique([...plan.warnings, ...outcome.warnings]),
+          backupRun: saved ? journal.runId : null,
+        });
+      } finally {
+        await rm(payloadRoot, {
+          recursive: true,
+          force: true,
+          maxRetries: 10,
+          retryDelay: 200,
+        }).catch(() => undefined);
+      }
+    });
   }
 
-  async pullAndApply(signal?: AbortSignal) {
+  /** Undo the most recent pull (files, settings); see lib/restore.ts. */
+  async restore(): Promise<RestoreResult> {
     return this.exclusive(async () => {
-      const { remoteScoped, local, appliedVendored, settings } =
-        await this.remoteAndLocal(signal);
-      const plan = this.pullPlan({
-        remoteScoped,
-        local,
-        appliedVendored,
-        settings,
-      });
-      const applied: string[] = [];
-      const skipped: string[] = [];
-      const errors: string[] = [];
-      const warnings = [...plan.warnings];
-
-      const attempt = async (label: string, operation: () => Promise<unknown>) => {
-        try {
-          await operation();
-          applied.push(label);
-          return true;
-        } catch (cause) {
-          errors.push(`${label}: ${errorMessage(cause)}`);
-          return false;
-        }
-      };
-
-      const currentMarketplaces = await this.bb.sdk.plugins.marketplaces.list({ signal });
-      const marketplaceMap = new Map(
-        currentMarketplaces.map((marketplace) => [marketplace.name, marketplace]),
-      );
-      for (const marketplace of remoteScoped.snapshot.marketplaces) {
-        const current = marketplaceMap.get(marketplace.name);
-        if (current === undefined) {
-          if (!isPortableMarketplaceSource(marketplace.source)) {
-            skipped.push(`Skipped local marketplace ${marketplace.name}`);
-            continue;
-          }
-          await attempt(`Added marketplace ${marketplace.name}`, () =>
-            this.bb.sdk.plugins.marketplaces.add({ source: marketplace.source }),
-          );
-        } else if (current.source !== marketplace.source) {
-          skipped.push(`Kept marketplace ${marketplace.name} with its existing source`);
-        }
-      }
-
-      // Fetch vendored payloads once when the preset carries any.
-      const vendoredCollections = remoteScoped.vendored.collections;
-      let vendoredPayloadDir: string | null = null;
-      if (vendoredCollections.length > 0) {
-        vendoredPayloadDir = await mkdtemp(join(tmpdir(), "bb-preset-pull-"));
-        await readRemotePreset({
-          repositoryUrl: settings.repositoryUrl,
-          branch: settings.branch,
-          githubToken: settings.githubToken,
-          copyVendoredTo: vendoredPayloadDir,
-          signal,
-        });
-      }
-      const vendoredPayloadRoot = vendoredPayloadDir;
-      let pluginList = await this.bb.sdk.plugins.list({ signal });
-      let installed = new Map(
-        pluginList.plugins.map((plugin) => [plugin.id, plugin]),
-      );
-      try {
-        const conflict = vendorConflictMode(settings.vendorConflictMode);
-        const collectionById = new Map(
-          vendoredCollections.map((entry) => [entry.id, entry]),
-        );
-        const collectionByPluginId = new Map(
-          vendoredCollections
-            .filter((entry) => entry.kind === "plugin")
-            .map((entry) => [entry.pluginId ?? entry.id, entry]),
-        );
-        const payloadSource = (collection: VendoredCollection) =>
-          isValidVendoredRepoDir(collection.repoDir)
-            ? join(
-                vendoredPayloadRoot ?? "",
-                ...collection.repoDir.replace(/^vendored\//, "").split("/"),
-              )
-            : null;
-
-        // File collections: materialize into their declared home-relative target.
-        for (const collection of vendoredCollections) {
-          if (collection.kind !== "files") continue;
-          if (
-            !isValidVendoredId(collection.id) ||
-            payloadSource(collection) === null
-          ) {
-            errors.push(
-              `Vendored ${collection.id}: invalid collection metadata`,
-            );
-            continue;
-          }
-          const targetDir = this.resolveVendoredTarget(collection.target);
-          const sourceDir = payloadSource(collection);
-          if (targetDir === null || sourceDir === null) {
-            errors.push(
-              `Vendored ${collection.id}: unsafe target ${collection.target ?? "?"}`,
-            );
-            continue;
-          }
-          const previouslyApplied = appliedVendored.collections[collection.id];
-          const targetExists = await lstat(targetDir)
-            .then((entry) => entry.isDirectory() && !entry.isSymbolicLink())
-            .catch(() => false);
-          if (previouslyApplied?.hash === collection.hash && targetExists) {
-            skipped.push(`Vendored ${collection.id} is already current`);
-            continue;
-          }
-          await attempt(
-            `Synced ${collection.fileCount} files to ${collection.target}`,
-            async () => {
-              const result = await materializeVendoredFiles({
-                sourceDir,
-                entries: collection.entries,
-                targetDir,
-                conflict,
-                pruneExtras: settings.vendorPruneExtras,
-                backupRoot: join(vendoredBackupRoot(), collection.id),
-              });
-              if (result.errors.length > 0) {
-                throw new Error(result.errors.slice(0, 3).join("; "));
-              }
-              for (const note of result.skipped) {
-                warnings.push(`Vendored ${collection.id}: skipped ${note}.`);
-              }
-              await recordVendorApplied(collection.id, {
-                hash: collection.hash,
-                target: collection.target,
-              });
-            },
-          );
-        }
-
-        // Vendored plugins: materialize into the managed dir, then install or
-        // update in place so plugin settings survive refreshes.
-        for (const plugin of remoteScoped.snapshot.plugins) {
-          if (plugin.id === SELF_PLUGIN_ID) continue;
-          // The install sentinel must carry this exact plugin id — anything
-          // else is a malformed or hostile entry.
-          if (vendoredPluginId(plugin.install) !== plugin.id) continue;
-          const collection = collectionByPluginId.get(plugin.id);
-          const pluginSourceDir =
-            collection === undefined ? null : payloadSource(collection);
-          if (
-            collection === undefined ||
-            pluginSourceDir === null ||
-            !isValidVendoredId(collection.id)
-          ) {
-            skipped.push(
-              `Skipped vendored plugin ${plugin.id}: payload missing or invalid`,
-            );
-            continue;
-          }
-          const current = installed.get(plugin.id);
-          if (current !== undefined) {
-            const currentPath = pluginPathSource(current);
-            const managed = vendoredPluginDir(plugin.id);
-            if (
-              currentPath === null ||
-              resolve(currentPath) !== resolve(managed)
-            ) {
-              skipped.push(
-                `Kept vendored plugin ${plugin.id} installed from its existing source`,
-              );
-              continue;
-            }
-          }
-          await attempt(
-            `${current === undefined ? "Installed" : "Updated"} vendored plugin ${plugin.id}`,
-            async () => {
-              const managed = vendoredPluginDir(plugin.id);
-              const managedExists = await lstat(managed)
-                .then((entry) => entry.isDirectory())
-                .catch(() => false);
-              if (
-                !managedExists ||
-                appliedVendored.collections[collection.id]?.hash !==
-                  collection.hash
-              ) {
-                const result = await materializeVendoredFiles({
-                  sourceDir: pluginSourceDir,
-                  entries: collection.entries,
-                  targetDir: managed,
-                  conflict: "overwrite",
-                  pruneExtras: true,
-                  backupRoot: join(
-                    vendoredTrashRoot(),
-                    `plugins/${collection.id}`,
-                  ),
-                  preserveNames: VENDORED_PLUGIN_PRESERVE_NAMES,
-                });
-                if (result.errors.length > 0) {
-                  throw new Error(result.errors.slice(0, 3).join("; "));
-                }
-                await recordVendorApplied(collection.id, {
-                  hash: collection.hash,
-                });
-              }
-              if (settings.vendorNpmInstall) {
-                const prepareIssue = await prepareVendoredPlugin(
-                  managed,
-                  (command, args, cwd) => this.runProcess(command, args, cwd),
-                );
-                if (prepareIssue !== null) {
-                  warnings.push(`Vendored plugin ${plugin.id}: ${prepareIssue}.`);
-                }
-              }
-              if (current === undefined) {
-                await this.bb.sdk.plugins.install({
-                  source: `path:${managed}`,
-                });
-              } else {
-                await this.bb.sdk.plugins
-                  .applyUpdate({ pluginId: plugin.id })
-                  .catch(() =>
-                    this.bb.sdk.plugins.reload({ pluginId: plugin.id }),
-                  );
-              }
-            },
-          );
-        }
-
-        pluginList = await this.bb.sdk.plugins.list({ signal });
-        installed = new Map(
-          pluginList.plugins.map((plugin) => [plugin.id, plugin]),
-        );
-
-        for (const plugin of remoteScoped.snapshot.plugins) {
-          if (plugin.id === SELF_PLUGIN_ID || installed.has(plugin.id)) continue;
-          if (vendoredPluginId(plugin.install) !== null) {
-            skipped.push(`Skipped vendored plugin ${plugin.id}`);
-            continue;
-          }
-          if (!isPortableInstallSource(plugin.install)) {
-            skipped.push(`Skipped local-path plugin ${plugin.id}`);
-            continue;
-          }
-          await attempt(`Installed plugin ${plugin.id}`, () =>
-            installPluginFromPreset(this.bb, plugin.install, signal),
-          );
-        }
-      } finally {
-        if (vendoredPayloadRoot !== null) {
-          await rm(vendoredPayloadRoot, {
-            recursive: true,
-            force: true,
-            maxRetries: 10,
-            retryDelay: 200,
-          }).catch(() => undefined);
-        }
-      }
-
-      pluginList = await this.bb.sdk.plugins.list({ signal });
-      installed = new Map(pluginList.plugins.map((plugin) => [plugin.id, plugin]));
-
-      const desiredSettings = new Map<string, PluginSettingPresetEntry[]>();
-      for (const entry of remoteScoped.snapshot.pluginSettings) {
-        if (
-          entry.id === SELF_PLUGIN_ID ||
-          settingSafetyIssue(entry.key, entry.value) !== null
-        ) {
-          continue;
-        }
-        const entries = desiredSettings.get(entry.id) ?? [];
-        entries.push(entry);
-        desiredSettings.set(entry.id, entries);
-      }
-      const settingsUpdated = new Set<string>();
-      for (const [pluginId, entries] of desiredSettings) {
-        if (!installed.has(pluginId)) {
-          skipped.push(`Skipped settings for missing plugin ${pluginId}`);
-          continue;
-        }
-        try {
-          const response = await this.bb.sdk.plugins.getSettings({ pluginId, signal });
-          const values: Record<string, string | boolean | number> = {};
-          for (const entry of entries) {
-            const descriptor = response.schema[entry.key];
-            if (
-              entry.value === null ||
-              descriptor === undefined ||
-              ("secret" in descriptor && descriptor.secret === true) ||
-              settingSafetyIssue(entry.key, entry.value) !== null ||
-              !settingValueMatchesDescriptor(descriptor, entry.value)
-            ) {
-              skipped.push(`Skipped unsafe or unknown setting ${pluginId}.${entry.key}`);
-              continue;
-            }
-            if (!sameJson(response.values[entry.key], entry.value)) {
-              values[entry.key] = entry.value;
-            }
-          }
-          if (Object.keys(values).length > 0) {
-            const ok = await attempt(
-              `Updated ${Object.keys(values).length} settings for ${pluginId}`,
-              () => this.bb.sdk.plugins.updateSettings({ pluginId, values }),
-            );
-            if (ok) settingsUpdated.add(pluginId);
-          }
-        } catch (cause) {
-          errors.push(`Settings for ${pluginId}: ${errorMessage(cause)}`);
-        }
-      }
-
-      const desiredPluginMap = new Map(
-        remoteScoped.snapshot.plugins.map((plugin) => [plugin.id, plugin]),
-      );
-      for (const [pluginId, desired] of desiredPluginMap) {
-        if (pluginId === SELF_PLUGIN_ID) continue;
-        const current = installed.get(pluginId);
-        if (current === undefined) continue;
-        if (current.enabled !== desired.enabled) {
-          await attempt(
-            `${desired.enabled ? "Enabled" : "Disabled"} plugin ${pluginId}`,
-            () =>
-              desired.enabled
-                ? this.bb.sdk.plugins.enable({ pluginId })
-                : this.bb.sdk.plugins.disable({ pluginId }),
-          );
-        } else if (desired.enabled && settingsUpdated.has(pluginId)) {
-          await attempt(`Reloaded plugin ${pluginId}`, () =>
-            this.bb.sdk.plugins.reload({ pluginId }),
-          );
-        }
-      }
-
-      if (!sameJson(local.snapshot.settings.generalSettings, remoteScoped.snapshot.settings.generalSettings)) {
-        await attempt("Updated BB general settings", () =>
-          this.bb.sdk.system.updateGeneralSettings(
-            remoteScoped.snapshot.settings.generalSettings as SystemConfig["generalSettings"],
-          ),
-        );
-      }
-      if (!sameJson(local.snapshot.settings.experiments, remoteScoped.snapshot.settings.experiments)) {
-        await attempt("Updated BB experiments", () =>
-          this.bb.sdk.system.updateExperiments(
-            remoteScoped.snapshot.settings.experiments as SystemConfig["experiments"],
-          ),
-        );
-      }
-      if (
-        !sameJson(
-          local.snapshot.settings.keybindingOverrides,
-          remoteScoped.snapshot.settings.keybindingOverrides,
-        )
-      ) {
-        await attempt("Updated keyboard shortcuts", () =>
-          this.bb.sdk.system.updateKeyboardSettings(
-            remoteScoped.snapshot.settings
-              .keybindingOverrides as SystemConfig["keybindingOverrides"],
-          ),
-        );
-      }
-      if (!sameJson(local.snapshot.settings.appearance, remoteScoped.snapshot.settings.appearance)) {
-        await attempt("Updated BB theme", () =>
-          this.bb.sdk.theme.set(remoteScoped.snapshot.settings.appearance),
-        );
-      }
-
-      const at = new Date().toISOString();
-      const ok = errors.length === 0;
+      const result = await restoreLastPull(this.bb, (base) => this.writeBase(base));
       await this.writeLastOperation({
         type: "pull",
-        at,
-        summary: ok
-          ? `Applied ${applied.length} changes from GitHub`
-          : `Applied ${applied.length} changes with ${errors.length} errors`,
+        at: new Date().toISOString(),
+        summary: `Restored ${result.restored.length} items from the last pull`,
       });
-      return {
-        ok,
-        plan,
-        applied,
-        skipped,
-        errors,
-        warnings: unique(warnings),
-      };
+      return result;
     });
   }
 }
